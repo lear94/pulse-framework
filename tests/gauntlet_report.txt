@@ -1,0 +1,38 @@
+---------------------------------------------------
+🔥 [LEVEL 6] SYSTEM GAUNTLET
+---------------------------------------------------
+[1;33m   -> Load Test...[0m
+Running 10s test @ http://127.0.0.1:8080/api/v1/users
+  8 threads and 200 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    47.15ms   31.05ms 378.80ms   97.20%
+    Req/Sec   577.40     93.39   750.00     80.10%
+  45210 requests in 10.02s, 18.41MB read
+  Socket errors: connect 0, read 0, write 0, timeout 2
+  Non-2xx or 3xx responses: 2
+Requests/sec:   4513.81
+Transfer/sec:      1.84MB
+[1;33m   -> Monitor Check...[0m
+>> Connecting to Pulse Uplink at http://127.0.0.1:8080/api/v1...
+
++--------------------+-------+
+| Metric             | Value |
++============================+
+| Uptime (s)         | 15    |
+|--------------------+-------|
+| Total Requests     | 45407 |
+|--------------------+-------|
+| Total Failures     | 2     |
+|--------------------+-------|
+| Active Connections | 0     |
+|--------------------+-------|
+| RAM Usage (MB)     | 33    |
+|--------------------+-------|
+| CPU Usage (%)      | 25.22 |
++--------------------+-------+
+[0;31m   -> Chaos: Killing Redis...[0m
+pulse_load_redis
+[1;33m   -> Survival Check...[0m
+[0;32m   SUCCESS[0m
+[0;32m✅ PASSED[0m
+./tests/06_gauntlet.sh: line 21: 79736 Killed                  ./target/release/$APP > /dev/null 2>&1  (wd: ~/development/pulse_framework/stress_target)

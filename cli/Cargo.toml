@@ -1,0 +1,18 @@
+[package]
+name = "pulse-cli"
+version = "1.1.0"
+edition = "2021"
+
+[dependencies]
+pulse_core = { path = "../" }
+
+clap = { version = "4.5", features = ["derive"] }
+colored = "3.0"
+comfy-table = "7.2"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1.48", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+anyhow = "1.0"
+dotenvy = "0.15.7"
+convert_case = "0.10"
