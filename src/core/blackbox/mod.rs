@@ -79,11 +79,22 @@ impl FlightRecorder for FallbackFlightRecorder {
     }
 
     async fn tail(&self, limit: usize) -> Vec<FlightRecord> {
-        let logs = self.primary.tail(limit).await;
-        if logs.is_empty() {
-            return self.backup.tail(limit).await;
+        // Combinamos primary y backup: tras una caída del primary, parte de los
+        // registros pueden vivir solo en el backup. Si nos quedáramos con el
+        // primary cuando no está vacío, esos registros quedarían invisibles.
+        let mut combined = self.primary.tail(limit).await;
+        let mut seen: std::collections::HashSet<String> =
+            combined.iter().map(|r| r.id.clone()).collect();
+        for record in self.backup.tail(limit).await {
+            if seen.insert(record.id.clone()) {
+                combined.push(record);
+            }
         }
-        logs
+        // timestamp es RFC3339 en UTC para ambos backends → orden lexicográfico
+        // equivale a orden cronológico. Más reciente primero.
+        combined.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        combined.truncate(limit);
+        combined
     }
 
     async fn scan_id(&self, id: &str) -> Option<FlightRecord> {

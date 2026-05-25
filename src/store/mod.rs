@@ -54,9 +54,16 @@ impl HybridStore {
     }
 
     fn enforce_capacity(&self) {
-        if self.local_data.len() >= LOCAL_CACHE_CAPACITY {
-            if let Some(key) = self.local_data.iter().next().map(|r| r.key().clone()) {
-                self.local_data.remove(&key);
+        // Acota el tamaño aunque varias tareas inserten en paralelo: evicta en
+        // bucle hasta dejar hueco para una entrada nueva. (Eviction aleatoria,
+        // no LRU: DashMap no preserva orden de acceso.)
+        while self.local_data.len() >= LOCAL_CACHE_CAPACITY {
+            let victim = self.local_data.iter().next().map(|r| r.key().clone());
+            match victim {
+                Some(key) => {
+                    self.local_data.remove(&key);
+                }
+                None => break,
             }
         }
     }

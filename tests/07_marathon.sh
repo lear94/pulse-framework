@@ -1,5 +1,11 @@
 #!/bin/bash
 set -e
+export JWT_SECRET="pulse-certification-secret-key"
+# Para que el conteo final sea real bajo el contrato nuevo: (a) subimos el rate
+# limit (PULSE_RATE_LIMIT_MAX alto) porque el registro está limitado por IP, y
+# (b) el post.lua randomiza username/email por request con un password válido, así
+# cada insert es único (no choca con UNIQUE) y no se queda en 1 sola fila.
+export PULSE_RATE_LIMIT_MAX=100000000
 LOG_FILE="tests/marathon_report.txt"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -21,7 +27,7 @@ function cleanup() {
     pkill -9 -f "$APP" || true
     docker rm -f $DB $REDIS > /dev/null 2>&1 || true
     if [ -f "pulse_core/src/lib.rs.bak" ]; then mv pulse_core/src/lib.rs.bak pulse_core/src/lib.rs; fi
-    rm -rf $APP
+    rm -rf $APP post.lua
 }
 
 trap cleanup EXIT
@@ -36,7 +42,7 @@ sleep 5
 # [FIX] Stabilization
 until docker exec $DB pg_isready -U p > /dev/null 2>&1; do sleep 1; done
 sleep 2
-docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, created_at TIMESTAMP);" > /dev/null
+docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, password_hash VARCHAR NOT NULL DEFAULT '', created_at TIMESTAMP);" > /dev/null
 docker exec -i $DB psql -U p -d d -c "CREATE TABLE blackbox_records (id UUID PRIMARY KEY, handler VARCHAR, payload JSONB, error VARCHAR, timestamp TIMESTAMP WITH TIME ZONE);" > /dev/null
 
 # Config
@@ -74,11 +80,21 @@ cd ..
 sleep 5
 
 echo -e "${YELLOW}   -> STARTING 1 MILLION REQUEST ATTACK (Duration: 300s)...${NC}"
+# Cada request genera un usuario ÚNICO (username/email aleatorios) con un password
+# válido: así los inserts no chocan con la constraint UNIQUE y el conteo final es real.
+cat << 'LUA' > post.lua
+math.randomseed(os.time() + (tonumber(tostring({}):sub(8)) or 0))
+request = function()
+    local n = math.random(1, 2000000000)
+    local body = string.format(
+        '{"username":"u%d","email":"e%d@test.com","password":"Str0ng-Pass1"}', n, n)
+    return wrk.format("POST", nil, {["Content-Type"] = "application/json"}, body)
+end
+LUA
 if command -v wrk &> /dev/null; then
-    echo 'wrk.method="POST"; wrk.body="{\"username\":\"u\",\"email\":\"e@t.com\"}"; wrk.headers["Content-Type"]="application/json"' > post.lua
     wrk -t12 -c400 -d300s -s post.lua http://127.0.0.1:8080/api/v1/users
 else
-    docker run --rm --net=host -v $(pwd)/post.lua:/post.lua williamyeh/wrk -t12 -c400 -d300s -s /post.lua http://127.0.0.1:8080/api/v1/users
+    docker run --rm --net=host -v "${HOST_PWD:-$(pwd)}/post.lua:/post.lua" williamyeh/wrk -t12 -c400 -d300s -s /post.lua http://127.0.0.1:8080/api/v1/users
 fi
 
 echo -e "${CYAN}   -> Verifying Data Integrity...${NC}"

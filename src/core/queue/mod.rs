@@ -23,4 +23,7 @@ pub trait TaskQueue: Send + Sync {
     ) -> Result<String, String>;
     async fn dequeue(&self) -> Result<Option<Job>, String>;
     async fn acknowledge(&self, job_id: &str) -> Result<(), String>;
+    /// Devuelve a la cola los jobs que quedaron en estado "processing"
+    /// (worker caído entre dequeue y acknowledge). Devuelve cuántos recuperó.
+    async fn recover_stale(&self) -> Result<usize, String>;
 }

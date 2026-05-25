@@ -12,12 +12,19 @@ pub struct RedisQueue {
 }
 
 impl RedisQueue {
-    pub fn new(pool: Pool) -> Self { Self { pool } }
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
 }
 
 #[async_trait]
 impl TaskQueue for RedisQueue {
-    async fn enqueue(&self, task_type: &str, payload: serde_json::Value, trace_id: Option<String>) -> Result<String, String> {
+    async fn enqueue(
+        &self,
+        task_type: &str,
+        payload: serde_json::Value,
+        trace_id: Option<String>,
+    ) -> Result<String, String> {
         let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
         let job = Job {
             id: Uuid::new_v4().to_string(),
@@ -28,20 +35,27 @@ impl TaskQueue for RedisQueue {
         };
         // [OPT] Serialización binaria para Redis
         let bytes = bincode::serialize(&job).map_err(|e| e.to_string())?;
-        let _: () = conn.rpush(QUEUE_KEY, bytes).await.map_err(|e| e.to_string())?;
+        // FIFO: encolamos por la izquierda (LPUSH) y consumimos por la derecha (RPOPLPUSH).
+        let _: () = conn
+            .lpush(QUEUE_KEY, bytes)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(job.id)
     }
 
     async fn dequeue(&self) -> Result<Option<Job>, String> {
         let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
         // Redis devuelve bytes
-        let result: Option<Vec<u8>> = conn.rpoplpush(QUEUE_KEY, PROCESSING_KEY).await.map_err(|e| e.to_string())?;
+        let result: Option<Vec<u8>> = conn
+            .rpoplpush(QUEUE_KEY, PROCESSING_KEY)
+            .await
+            .map_err(|e| e.to_string())?;
         match result {
             Some(bytes) => {
                 let job: Job = bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
                 Ok(Some(job))
-            },
-            None => Ok(None)
+            }
+            None => Ok(None),
         }
     }
 
@@ -50,15 +64,40 @@ impl TaskQueue for RedisQueue {
         // Para ack, necesitamos iterar. Esto es costoso en binario sin índices, pero aceptable para colas medianas.
         // En un sistema V7, usaríamos ZSETs para esto.
         // Por ahora mantenemos la lógica pero deserializamos.
-        let pending: Vec<Vec<u8>> = conn.lrange(PROCESSING_KEY, 0, -1).await.map_err(|e| e.to_string())?;
+        let pending: Vec<Vec<u8>> = conn
+            .lrange(PROCESSING_KEY, 0, -1)
+            .await
+            .map_err(|e| e.to_string())?;
         for bytes in pending {
             if let Ok(job) = bincode::deserialize::<Job>(&bytes) {
                 if job.id == job_id {
-                    let _: () = conn.lrem(PROCESSING_KEY, 1, bytes).await.map_err(|e| e.to_string())?;
+                    let _: () = conn
+                        .lrem(PROCESSING_KEY, 1, bytes)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    async fn recover_stale(&self) -> Result<usize, String> {
+        // Recuperación de jobs in-flight: si un worker murió tras el dequeue
+        // (RPOPLPUSH) pero antes del acknowledge, el job quedó atascado en
+        // PROCESSING_KEY. Lo movemos atómicamente de vuelta a la cola.
+        let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
+        let mut count = 0usize;
+        loop {
+            let moved: Option<Vec<u8>> = conn
+                .rpoplpush(PROCESSING_KEY, QUEUE_KEY)
+                .await
+                .map_err(|e| e.to_string())?;
+            match moved {
+                Some(_) => count += 1,
+                None => break,
+            }
+        }
+        Ok(count)
     }
 }

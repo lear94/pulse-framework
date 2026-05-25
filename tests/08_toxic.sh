@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export JWT_SECRET="pulse-certification-secret-key"
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 RED='\033[0;31m'
@@ -16,7 +17,7 @@ echo "---------------------------------------------------"
 function cleanup() {
     pkill -9 -f "$APP" || true
     docker rm -f $DB > /dev/null 2>&1 || true
-    rm -rf $APP toxic_payload.json
+    rm -rf $APP toxic_payload.json toxic_blob.json large_blob.txt toxic_server.log
 }
 trap cleanup EXIT
 cleanup
@@ -25,7 +26,7 @@ echo -n "   -> Infra (DB Port 5437)..."
 docker run --name $DB --shm-size=256mb -e POSTGRES_PASSWORD=s -e POSTGRES_USER=p -e POSTGRES_DB=d -p 5437:5432 -d postgres:alpine > /dev/null
 until docker exec $DB pg_isready -U p > /dev/null 2>&1; do sleep 1; done
 sleep 2
-docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, created_at TIMESTAMP);" > /dev/null
+docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, password_hash VARCHAR NOT NULL DEFAULT '', created_at TIMESTAMP);" > /dev/null
 docker exec -i $DB psql -U p -d d -c "CREATE TABLE blackbox_records (id UUID PRIMARY KEY, handler VARCHAR, payload JSONB, error VARCHAR, timestamp TIMESTAMP WITH TIME ZONE);" > /dev/null
 echo " OK."
 
@@ -49,12 +50,13 @@ RUST
 
 cd $APP
 cargo build --release --quiet
-RUST_LOG=error ./target/release/$APP > /dev/null 2>&1 &
+# Capturamos stderr/stdout del server (incl. mensajes de panic) para diagnóstico.
+RUST_LOG=info ./target/release/$APP > ../toxic_server.log 2>&1 &
 SERVER_PID=$!
 cd ..
 
 echo -n "   -> Waiting App..."
-while ! curl -s http://127.0.0.1:8084/health > /dev/null; do sleep 0.5; done
+while ! curl -s http://127.0.0.1:8084/api/v1/health > /dev/null; do sleep 0.5; done
 echo " ONLINE."
 
 # TEST 1: RECURSION BOMB
@@ -97,12 +99,25 @@ else
     exit 1
 fi
 
-# SUPERVIVENCIA
+# SUPERVIVENCIA (con reintentos: el server puede tardar un instante tras el blob)
 echo -n "   -> Vital Signs Check..."
-if curl -s http://127.0.0.1:8084/health | grep -q "operational"; then
+ALIVE=0
+for _ in $(seq 1 20); do
+    if curl -s http://127.0.0.1:8084/api/v1/health | grep -q "operational"; then ALIVE=1; break; fi
+    sleep 0.5
+done
+if [ "$ALIVE" = "1" ]; then
     echo -e "${GREEN} PULSE DETECTED${NC}"
 else
     echo -e "${RED} FLATLINE${NC}"
+    echo -e "${YELLOW}   -> Server process status:${NC}"
+    if kill -0 $SERVER_PID 2>/dev/null; then
+        echo "      process $SERVER_PID is STILL ALIVE (so it's the health check, not a crash)"
+    else
+        echo "      process $SERVER_PID is DEAD (crashed or OOM-killed)"
+    fi
+    echo -e "${YELLOW}   -> Last lines of server log:${NC}"
+    tail -n 40 toxic_server.log 2>/dev/null | sed 's/^/      /'
     exit 1
 fi
 

@@ -1,0 +1,39 @@
+# Harness para ejecutar la suite de certificación completa (run_tests.sh) de
+# forma reproducible: trae el toolchain de Rust + las dependencias nativas
+# (pkg-config, libssl-dev) que faltan en muchos entornos, el cliente de Docker
+# (los scripts levantan Postgres/Redis con `docker run`), curl y utilidades.
+#
+# NO es una imagen de producción: es un runner de tests.
+# Uso recomendado: ./docker-test.sh   (monta socket de Docker + red host)
+#
+# Toolchain: "1" = última estable 1.x. Hace falta >=1.85 porque algunas
+# dependencias transitivas (p.ej. base64ct 1.8) ya requieren edition2024.
+FROM rust:1-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+        curl \
+        git \
+        procps \
+        docker.io \
+        postgresql-client \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# wrk se instala NATIVO (no vía `docker run williamyeh/wrk`): al correr esta suite
+# dentro de un contenedor, un wrk anidado intentaría montar `-v $(pwd)/post.lua`
+# usando la ruta del contenedor (/app/...) que NO existe en el host donde corre el
+# daemon → Docker crea un directorio vacío y wrk falla con "Is a directory".
+# Compilándolo aquí, los niveles 6 y 7 leen post.lua del FS local directamente.
+RUN git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk \
+    && make -C /tmp/wrk -j"$(nproc)" \
+    && cp /tmp/wrk/wrk /usr/local/bin/wrk \
+    && rm -rf /tmp/wrk
+
+WORKDIR /app
+
+# El código fuente se monta como volumen en runtime (ver docker-test.sh) para no
+# tener que reconstruir la imagen ante cada cambio.
+CMD ["bash", "run_tests.sh"]

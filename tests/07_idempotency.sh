@@ -1,5 +1,8 @@
 #!/bin/bash
 set -e
+export JWT_SECRET="pulse-certification-secret-key"
+# PatientZero será admin para poder invocar /admin/replay.
+export PULSE_ADMIN_USERS="PatientZero"
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 RED='\033[0;31m'
@@ -26,7 +29,7 @@ docker run --name $DB --shm-size=256mb -e POSTGRES_PASSWORD=s -e POSTGRES_USER=p
 until docker exec $DB pg_isready -U p > /dev/null 2>&1; do sleep 1; done
 sleep 2
 # Schema Injection
-docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, created_at TIMESTAMP);" > /dev/null
+docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR UNIQUE, email VARCHAR UNIQUE, password_hash VARCHAR NOT NULL DEFAULT '', created_at TIMESTAMP);" > /dev/null
 docker exec -i $DB psql -U p -d d -c "CREATE TABLE blackbox_records (id UUID PRIMARY KEY, handler VARCHAR, payload JSONB, error VARCHAR, timestamp TIMESTAMP WITH TIME ZONE);" > /dev/null
 echo " OK."
 
@@ -55,14 +58,24 @@ SERVER_PID=$!
 cd ..
 
 echo -n "   -> Waiting App..."
-while ! curl -s http://127.0.0.1:8083/health > /dev/null; do sleep 0.5; done
+while ! curl -s http://127.0.0.1:8083/api/v1/health > /dev/null; do sleep 0.5; done
 echo " ONLINE."
 
 # 1. Crear usuario legítimo
 echo -e "${CYAN}   -> Step 1: Creating legitimate user 'PatientZero'...${NC}"
 curl -s -X POST http://127.0.0.1:8083/api/v1/users \
      -H "Content-Type: application/json" \
-     -d '{"username":"PatientZero","email":"zero@labs.com"}' > /dev/null
+     -d '{"username":"PatientZero","email":"zero@labs.com","password":"Str0ng-Pass1"}' > /dev/null
+
+# 1b. Login como admin (PatientZero está en PULSE_ADMIN_USERS) para obtener token.
+echo -e "${CYAN}   -> Step 1b: Logging in to obtain admin token...${NC}"
+LOGIN_RESP=$(curl -s -X POST http://127.0.0.1:8083/api/v1/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"username":"PatientZero","password":"Str0ng-Pass1"}')
+TOKEN=$(echo "$LOGIN_RESP" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ -z "$TOKEN" ]; then
+    echo -e "${RED}   -> FAIL: could not obtain admin token. Response: $LOGIN_RESP${NC}"; exit 1
+fi
 
 # 2. Inyectar manualmente un fallo falso en Blackbox (El usuario ya existe, pero fingimos que falló)
 echo -e "${CYAN}   -> Step 2: Injecting Fake Failure record...${NC}"
@@ -74,7 +87,8 @@ docker exec -i $DB psql -U p -d d -c "$SQL" > /dev/null
 
 # 3. Intentar Replay (Debe detectar duplicado)
 echo -e "${YELLOW}   -> Step 3: Triggering Lazarus Protocol on existing data...${NC}"
-RESPONSE=$(curl -s -X POST http://127.0.0.1:8083/api/v1/admin/replay/$FAKE_ID)
+RESPONSE=$(curl -s -X POST http://127.0.0.1:8083/api/v1/admin/replay/$FAKE_ID \
+     -H "Authorization: Bearer $TOKEN")
 
 echo -e "      Response: $(echo $RESPONSE | cut -c 1-60)..."
 

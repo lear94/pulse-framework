@@ -1,5 +1,7 @@
 #!/bin/bash
 set -e
+# bootstrap() ahora exige JWT_SECRET >=16 chars.
+export JWT_SECRET="pulse-certification-secret-key"
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
@@ -52,7 +54,7 @@ cd ..
 
 echo -n "   -> Waiting App..."
 COUNT=0
-while ! curl -s http://127.0.0.1:8081/health > /dev/null; do
+while ! curl -s http://127.0.0.1:8081/api/v1/health > /dev/null; do
     sleep 0.5
     COUNT=$((COUNT+1))
     if [ $COUNT -ge 20 ]; then echo -e "${RED} TIMEOUT${NC}"; exit 1; fi

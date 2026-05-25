@@ -14,6 +14,10 @@ pub struct Model {
     pub username: String,
     #[schema(example = "admin@example.com")]
     pub email: String,
+    // Nunca se expone en respuestas JSON ni se exige al deserializar
+    // (caché/blackbox). Solo vive en la BD.
+    #[serde(default, skip_serializing)]
+    pub password_hash: String,
     #[serde(skip_deserializing)]
     pub created_at: DateTime,
 }

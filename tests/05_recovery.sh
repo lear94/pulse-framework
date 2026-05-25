@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export JWT_SECRET="pulse-certification-secret-key"
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
@@ -25,7 +26,7 @@ docker run --name $DB --shm-size=256mb -e POSTGRES_PASSWORD=s -e POSTGRES_USER=p
 until docker exec $DB pg_isready -U p > /dev/null 2>&1; do sleep 1; done
 # [FIX] Stabilization sleep before schema injection
 sleep 2
-docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, created_at TIMESTAMP);" > /dev/null
+docker exec -i $DB psql -U p -d d -c "CREATE TABLE users (id UUID PRIMARY KEY, username VARCHAR, email VARCHAR, password_hash VARCHAR NOT NULL DEFAULT '', created_at TIMESTAMP);" > /dev/null
 docker exec -i $DB psql -U p -d d -c "CREATE TABLE blackbox_records (id UUID PRIMARY KEY, handler VARCHAR, payload JSONB, error VARCHAR, timestamp TIMESTAMP WITH TIME ZONE);" > /dev/null
 echo " OK."
 
@@ -54,7 +55,7 @@ cd ..
 
 echo -n "   -> Waiting App..."
 sleep 3
-while ! curl -s http://127.0.0.1:8082/health > /dev/null; do sleep 1; done
+while ! curl -s http://127.0.0.1:8082/api/v1/health > /dev/null; do sleep 1; done
 echo " ONLINE."
 
 echo -n "   -> ⚡ SABOTAGE: Killing DB Container..."
@@ -64,7 +65,7 @@ echo " DONE."
 echo -n "   -> Sending Payload..."
 curl -s -X POST http://127.0.0.1:8082/api/v1/users \
      -H "Content-Type: application/json" \
-     -d '{"username":"survivor","email":"hope@future.com"}' > /dev/null
+     -d '{"username":"survivor","email":"hope@future.com","password":"Str0ng-Pass1"}' > /dev/null
 sleep 1
 
 # Check correct path inside app

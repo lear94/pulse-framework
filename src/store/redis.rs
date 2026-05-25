@@ -9,21 +9,30 @@ use futures::StreamExt;
 use std::sync::Arc;
 use tokio::task;
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 const INVALIDATION_CHANNEL: &str = "pulse:cache:invalidate";
 
 pub struct RedisBackend {
     pool: Pool,
     url: String,
+    // Identidad de esta instancia para distinguir nuestras propias
+    // invalidaciones de las de otros nodos.
+    instance_id: String,
 }
 
 impl RedisBackend {
     pub fn new(pool: Pool, url: String) -> Self {
-        Self { pool, url }
+        Self {
+            pool,
+            url,
+            instance_id: Uuid::new_v4().to_string(),
+        }
     }
 
     async fn listen_loop(
         url: &str,
+        instance_id: &str,
         local_cache: Arc<DashMap<String, Vec<u8>>>,
     ) -> HybridResult<()> {
         let client = Client::open(url).map_err(HybridError::Redis)?;
@@ -37,9 +46,20 @@ impl RedisBackend {
             .map_err(HybridError::Redis)?;
         let mut stream = pubsub.into_on_message();
         while let Some(msg) = stream.next().await {
-            let key_to_invalidate: String = msg.get_payload().map_err(HybridError::Redis)?;
-            local_cache.remove(&key_to_invalidate);
-            debug!("Cache INVALIDATED remotely for: {}", key_to_invalidate);
+            // Formato del mensaje: "<origin_instance_id>|<key>".
+            let raw: String = msg.get_payload().map_err(HybridError::Redis)?;
+            let (origin, key) = match raw.split_once('|') {
+                Some((o, k)) => (o, k),
+                None => ("", raw.as_str()),
+            };
+            // Ignoramos nuestras propias invalidaciones: ya escribimos el valor
+            // fresco en el caché local, borrarlo provocaría un miss innecesario
+            // y rompería el read-your-writes.
+            if origin == instance_id {
+                continue;
+            }
+            local_cache.remove(key);
+            debug!("Cache INVALIDATED remotely for: {}", key);
         }
         Err(HybridError::NotAvailable)
     }
@@ -57,22 +77,33 @@ impl CacheBackend for RedisBackend {
         let mut conn = self.pool.get().await?;
         let redis_key = format!("pulse:{}", key);
         let _: () = conn.set(&redis_key, value).await?;
-        let _: () = conn.publish(INVALIDATION_CHANNEL, key).await?;
+        let _: () = conn
+            .publish(
+                INVALIDATION_CHANNEL,
+                format!("{}|{}", self.instance_id, key),
+            )
+            .await?;
         Ok(())
     }
     async fn del(&self, key: &str) -> HybridResult<()> {
         let mut conn = self.pool.get().await?;
         let redis_key = format!("pulse:{}", key);
         let _: () = conn.del(&redis_key).await?;
-        let _: () = conn.publish(INVALIDATION_CHANNEL, key).await?;
+        let _: () = conn
+            .publish(
+                INVALIDATION_CHANNEL,
+                format!("{}|{}", self.instance_id, key),
+            )
+            .await?;
         Ok(())
     }
     async fn subscribe_to_invalidations(&self, local_cache: Arc<DashMap<String, Vec<u8>>>) {
         let url = self.url.clone();
+        let instance_id = self.instance_id.clone();
         task::spawn(async move {
             info!("Redis Invalidation Listener started.");
             loop {
-                match Self::listen_loop(&url, local_cache.clone()).await {
+                match Self::listen_loop(&url, &instance_id, local_cache.clone()).await {
                     Ok(_) => debug!("Redis loop closed."),
                     Err(e) => {
                         error!("Redis error: {}. Retry in 5s...", e);

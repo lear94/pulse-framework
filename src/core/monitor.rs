@@ -34,18 +34,27 @@ impl SystemMonitor {
                 RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
             );
             let pid = Pid::from_u32(std::process::id());
+            // sysinfo necesita dos muestras separadas por MINIMUM_CPU_UPDATE_INTERVAL
+            // para calcular % de CPU; sin esto la primera lectura siempre sería 0.
+            sys.refresh_cpu_all();
+            tokio::time::sleep(Duration::from_millis(250)).await;
             loop {
                 sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                 sys.refresh_cpu_all();
-                
-                let app_mem = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+
+                let app_mem = sys
+                    .process(pid)
+                    .map(|p| p.memory() / 1024 / 1024)
+                    .unwrap_or(0);
                 let total_mem = sys.used_memory() / 1024 / 1024;
                 let cpu = sys.global_cpu_usage();
 
                 mon_clone.app_ram_mb.store(app_mem, Ordering::Relaxed);
                 mon_clone.sys_ram_mb.store(total_mem, Ordering::Relaxed);
-                mon_clone.cpu_usage_bits.store(cpu.to_bits(), Ordering::Relaxed);
-                
+                mon_clone
+                    .cpu_usage_bits
+                    .store(cpu.to_bits(), Ordering::Relaxed);
+
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });

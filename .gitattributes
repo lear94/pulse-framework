@@ -1,0 +1,8 @@
+# Fuerza LF en scripts y archivos sensibles a finales de línea, para que
+# funcionen al ejecutarse dentro de contenedores Linux aunque se hayan editado
+# en Windows (evita el error `$'\r': command not found`).
+*.sh        text eol=lf
+run_tests.sh text eol=lf
+Dockerfile* text eol=lf
+*.rs        text eol=lf
+*.toml      text eol=lf

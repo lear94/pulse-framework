@@ -3,6 +3,17 @@ use leptos::*;
 use serde::{Deserialize, Serialize};
 
 const API_URL: &str = "http://localhost:8080/api/v1";
+// Token JWT (rol admin) embebido en build: `PULSE_TOKEN=... trunk build`.
+// Los endpoints /admin/* exigen rol admin.
+const AUTH_TOKEN: Option<&str> = option_env!("PULSE_TOKEN");
+
+fn admin_get(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(token) = AUTH_TOKEN {
+        req = req.bearer_auth(token);
+    }
+    req
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MonitorSnapshot {
@@ -38,13 +49,20 @@ fn App() -> impl IntoView {
 
     create_effect(move |_| {
         spawn_local(async move {
+            let client = reqwest::Client::new();
             loop {
-                if let Ok(res) = reqwest::get(format!("{}/admin/monitor", API_URL)).await {
+                if let Ok(res) = admin_get(&client, format!("{}/admin/monitor", API_URL))
+                    .send()
+                    .await
+                {
                     if let Ok(data) = res.json::<MonitorSnapshot>().await {
                         set_monitor.set(Some(data));
                     }
                 }
-                if let Ok(res) = reqwest::get(format!("{}/admin/morgue", API_URL)).await {
+                if let Ok(res) = admin_get(&client, format!("{}/admin/morgue", API_URL))
+                    .send()
+                    .await
+                {
                     if let Ok(data) = res.json::<Vec<FlightRecord>>().await {
                         set_morgue.update(|current| {
                             if current.len() != data.len() {
@@ -65,11 +83,11 @@ fn App() -> impl IntoView {
         )));
         spawn_local(async move {
             let client = reqwest::Client::new();
-            match client
-                .post(format!("{}/admin/replay/{}", API_URL, id))
-                .send()
-                .await
-            {
+            let mut replay_req = client.post(format!("{}/admin/replay/{}", API_URL, id));
+            if let Some(token) = AUTH_TOKEN {
+                replay_req = replay_req.bearer_auth(token);
+            }
+            match replay_req.send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         set_status.set(SystemStatus::Success(format!(

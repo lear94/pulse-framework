@@ -12,6 +12,10 @@ pub enum AppError {
     ValidationError(String),
     #[error("Resource not found")]
     NotFound,
+    #[error("Conflict: {0}")]
+    Conflict(String),
+    #[error("Too many requests")]
+    RateLimited,
     #[error("System overload")]
     SystemOverload,
 }
@@ -29,6 +33,8 @@ impl ResponseError for AppError {
             AppError::AuthError(_) => StatusCode::UNAUTHORIZED,
             AppError::ValidationError(_) => StatusCode::BAD_REQUEST,
             AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             AppError::SystemOverload => StatusCode::TOO_MANY_REQUESTS,
         }
     }

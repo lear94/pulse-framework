@@ -21,8 +21,17 @@ echo -e "${GREEN}>>> Passed.${NC}"
 
 echo ""
 echo -e "${CYAN}[9/9] THE MARATHON (Optional - 5 min)${NC}"
-read -p "Run the 1 Million Request Marathon? (y/n) " -n 1 -r
-echo ""
+# No-interactivo (Docker/CI): se salta salvo que pidas RUN_MARATHON=1.
+# Interactivo: pregunta como siempre.
+if [ -t 0 ]; then
+    read -p "Run the 1 Million Request Marathon? (y/n) " -n 1 -r
+    echo ""
+elif [ "${RUN_MARATHON:-0}" = "1" ]; then
+    REPLY=y
+else
+    REPLY=n
+    echo "   (non-interactive: skipping marathon; set RUN_MARATHON=1 to force)"
+fi
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     ./tests/07_marathon.sh
 fi

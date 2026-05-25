@@ -21,12 +21,14 @@ pub use utoipa_swagger_ui;
 pub use uuid;
 
 use crate::auth::jwt::JwtProvider;
+use crate::auth::revocation::{MemoryRevocationStore, RedisRevocationStore, RevocationStore};
 use crate::auth::IdentityProvider;
 use crate::core::blackbox::{
     db::DbRecorder, disk::DiskRecorder, FallbackFlightRecorder, FlightRecorder,
 };
 use crate::core::orchestrator::Orchestrator;
 use crate::core::queue::{memory::MemoryQueue, redis::RedisQueue, TaskQueue};
+use crate::core::ratelimit::RateLimiter;
 use crate::pulse::{memory::MemoryReactor, redis::RedisReactor, PulseReactor};
 use crate::state::AppState;
 use crate::store::{memory::MemoryBackend, redis::RedisBackend, CacheBackend, HybridStore};
@@ -115,8 +117,40 @@ where
         None
     };
 
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".into());
-    let auth_provider: Arc<dyn IdentityProvider> = Arc::new(JwtProvider::new(jwt_secret));
+    // El secret JWT NO tiene default: arrancar con un valor conocido permitiría
+    // forjar tokens. Exigimos uno explícito y razonablemente fuerte.
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .expect("JWT_SECRET must be set (refusing to start with an insecure default)");
+    if jwt_secret.len() < 16 {
+        panic!("JWT_SECRET is too weak: provide at least 16 characters");
+    }
+    let access_ttl: i64 = std::env::var("PULSE_ACCESS_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+    let refresh_ttl: i64 = std::env::var("PULSE_REFRESH_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7 * 24 * 3600);
+    let auth_provider: Arc<dyn IdentityProvider> =
+        Arc::new(JwtProvider::with_ttls(jwt_secret, access_ttl, refresh_ttl));
+
+    // Denylist de tokens (logout): distribuida si hay Redis, en memoria si no.
+    let revocations: Arc<dyn RevocationStore> = match redis_pool.clone() {
+        Some(pool) => Arc::new(RedisRevocationStore::new(pool)),
+        None => Arc::new(MemoryRevocationStore::new()),
+    };
+
+    // Rate limiter (por IP, por proceso). Configurable por entorno.
+    let rl_max: u32 = std::env::var("PULSE_RATE_LIMIT_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let rl_window: u64 = std::env::var("PULSE_RATE_LIMIT_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let rate_limiter = Arc::new(RateLimiter::new(rl_max, Duration::from_secs(rl_window)));
 
     let db_recorder = Arc::new(DbRecorder::new(db.clone()));
     let disk_recorder = Arc::new(DiskRecorder::new());
@@ -131,19 +165,45 @@ where
         blackbox,
         queue.clone(),
         orchestrator,
+        revocations,
+        rate_limiter,
+        redis_pool.clone(),
     );
 
+    // Recuperación de jobs in-flight de una ejecución anterior (worker caído
+    // entre dequeue y acknowledge) antes de empezar a consumir.
+    match queue.recover_stale().await {
+        Ok(0) => {}
+        Ok(n) => warn!("♻️ Recovered {} in-flight job(s) from a previous run.", n),
+        Err(e) => warn!("Failed to recover stale jobs: {}", e),
+    }
+
+    // Canal de apagado: al recibir SIGINT/SIGTERM dejamos de tomar jobs nuevos
+    // pero terminamos (y ack) el que esté en curso, evitando perder trabajo.
+    let (shutdown_tx, mut worker_shutdown) = tokio::sync::watch::channel(false);
+
     let queue_clone = queue.clone();
-    tokio::spawn(async move {
+    let worker = tokio::spawn(async move {
         loop {
-            if let Ok(Some(job)) = queue_clone.dequeue().await {
-                info!("⚙️ Processing Job: {} [{}]", job.id, job.task_type);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let _ = queue_clone.acknowledge(&job.id).await;
-            } else {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            if *worker_shutdown.borrow() {
+                break;
+            }
+            match queue_clone.dequeue().await {
+                Ok(Some(job)) => {
+                    info!("⚙️ Processing Job: {} [{}]", job.id, job.task_type);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = queue_clone.acknowledge(&job.id).await;
+                }
+                _ => {
+                    // Espera 1s o despierta de inmediato si llega el apagado.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = worker_shutdown.changed() => {}
+                    }
+                }
             }
         }
+        info!("🧵 Job worker stopped gracefully.");
     });
 
     tokio::spawn(async move {
@@ -154,11 +214,34 @@ where
 
     tracing::info!("🚀 Pulse Engine Ignited at {}:{}", config.host, config.port);
 
-    HttpServer::new(move || {
+    // CORS configurable por entorno. Sin `PULSE_CORS_ORIGINS` el comportamiento
+    // por defecto es restrictivo (no permitir orígenes cruzados), en lugar del
+    // antiguo `Cors::permissive()` que aceptaba cualquier origen.
+    let cors_origins: Vec<String> = std::env::var("PULSE_CORS_ORIGINS")
+        .map(|s| {
+            s.split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if cors_origins.is_empty() {
+        warn!("CORS: no PULSE_CORS_ORIGINS set — cross-origin requests will be denied.");
+    }
+
+    let server = HttpServer::new(move || {
+        let mut cors = Cors::default()
+            .allow_any_method()
+            .allow_any_header()
+            .max_age(3600);
+        for origin in &cors_origins {
+            cors = cors.allowed_origin(origin.as_str());
+        }
+
         App::new()
             .wrap(middleware::Compress::default())
             .wrap(TracingLogger::default())
-            .wrap(Cors::permissive())
+            .wrap(cors)
             .wrap(middleware::DefaultHeaders::new().add(("X-Pulse-Version", "3.0-Autonomy")))
             .app_data(web::Data::new(state.clone()))
             .configure(api_config)
@@ -167,6 +250,23 @@ where
             )
     })
     .bind((config.host.as_str(), config.port))?
-    .run()
-    .await
+    // Da tiempo a que las conexiones en curso terminen antes de cerrar.
+    .shutdown_timeout(30)
+    .run();
+
+    // actix gestiona SIGINT/SIGTERM y termina `server` limpiamente.
+    let server_result = server.await;
+
+    // Una vez parado el HTTP server, paramos el worker y esperamos a que el job
+    // en curso (si lo hay) termine y haga ack.
+    tracing::info!("🛑 Shutdown signal received: draining job worker...");
+    let _ = shutdown_tx.send(true);
+    if tokio::time::timeout(Duration::from_secs(30), worker)
+        .await
+        .is_err()
+    {
+        warn!("Job worker did not stop within 30s; forcing exit.");
+    }
+
+    server_result
 }

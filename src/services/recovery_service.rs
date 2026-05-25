@@ -1,7 +1,7 @@
 use crate::core::blackbox::FlightRecord;
-use crate::models::user;
 use crate::services::user_service::UserService;
 use crate::state::AppState;
+use uuid::Uuid;
 
 pub struct RecoveryService;
 
@@ -30,11 +30,26 @@ impl RecoveryService {
             .ok_or("Job not found in BlackBox")?;
         match job.handler.as_str() {
             "create_user" => {
-                let form: user::Model = serde_json::from_value(job.payload.clone())
-                    .map_err(|_| "Invalid payload structure")?;
-                UserService::create_user(state, form)
+                // El payload del blackbox nunca contiene la contraseña (no se
+                // persisten credenciales). Resucitamos con una contraseña
+                // temporal aleatoria; el usuario deberá restablecerla.
+                let username = job.payload["username"]
+                    .as_str()
+                    .ok_or("Invalid payload: missing username")?
+                    .to_string();
+                let email = job.payload["email"]
+                    .as_str()
+                    .ok_or("Invalid payload: missing email")?
+                    .to_string();
+                let temp_password = Uuid::new_v4().to_string();
+                UserService::create_user(state, username, email, temp_password)
                     .await
-                    .map(|u| format!("REPLAY SUCCESS: User {} resurrected", u.id))
+                    .map(|u| {
+                        format!(
+                            "REPLAY SUCCESS: User {} resurrected (temporary password set; reset required)",
+                            u.id
+                        )
+                    })
                     .map_err(|e| e.to_string())
             }
             _ => Err(format!("Unknown handler: {}", job.handler)),

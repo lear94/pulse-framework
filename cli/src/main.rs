@@ -32,6 +32,12 @@ enum Commands {
     OpsReplay { id: String },
 }
 
+/// Token JWT (rol admin) para los endpoints protegidos. Obtén uno vía
+/// `POST /api/v1/auth/login` y expórtalo como PULSE_TOKEN.
+fn auth_token() -> Option<String> {
+    std::env::var("PULSE_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -56,10 +62,11 @@ async fn fetch_monitor(api_url: &str) -> Result<()> {
         api_url
     );
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{}/admin/monitor", api_url))
-        .send()
-        .await?;
+    let mut req = client.get(format!("{}/admin/monitor", api_url));
+    if let Some(token) = auth_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
 
     if !resp.status().is_success() {
         println!(
@@ -84,7 +91,20 @@ async fn fetch_monitor(api_url: &str) -> Result<()> {
 }
 
 async fn fetch_morgue(api_url: &str) -> Result<()> {
-    let resp = reqwest::get(format!("{}/admin/morgue", api_url)).await?;
+    let client = reqwest::Client::new();
+    let mut req = client.get(format!("{}/admin/morgue", api_url));
+    if let Some(token) = auth_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        println!(
+            "{} Failed to fetch morgue: {}",
+            ">> ERROR:".red(),
+            resp.status()
+        );
+        return Ok(());
+    }
     let records: Vec<FlightRecord> = resp.json().await?;
     println!(
         "{} Found {} records in blackbox.",
@@ -117,7 +137,11 @@ async fn trigger_replay(api_url: &str, id: &str) -> Result<()> {
         ">> REPLAY:".cyan().bold(),
         id.yellow()
     );
-    let resp = client.post(&url).send().await?;
+    let mut req = client.post(&url);
+    if let Some(token) = auth_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
     if resp.status().is_success() {
         println!(
             "{} Replay successful. Job resurrected.",
@@ -193,7 +217,7 @@ async fn main() -> std::io::Result<()> {
     write_file(&format!("{}/src/main.rs", name), main_rs)?;
 
     let env_example =
-        "RUST_LOG=info\nDATABASE_URL=postgres://user:pass@localhost:5432/db\nJWT_SECRET=secret\n";
+        "RUST_LOG=info\nDATABASE_URL=postgres://user:pass@localhost:5432/db\n# JWT_SECRET must be >=16 chars; replace with a random value (openssl rand -base64 48)\nJWT_SECRET=change-me-to-a-long-random-secret\nPULSE_ADMIN_USERS=\n";
     write_file(&format!("{}/.env", name), env_example)?;
 
     println!(
