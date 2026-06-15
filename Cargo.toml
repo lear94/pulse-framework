@@ -39,6 +39,14 @@ migration = { path = "migration" }
 deadpool-redis = { version = "0.22", features = ["rt_tokio_1"] }
 redis = { version = "0.32.7", features = ["tokio-comp"] }
 
+# LDAP/AD: opcional, solo se compila con --features ldap (no infla el build base).
+ldap3 = { version = "0.11", default-features = false, features = ["tls-native"], optional = true }
+
+[features]
+default = []
+# Activa el Authenticator LDAP/Active Directory (auth::ldap).
+ldap = ["dep:ldap3"]
+
 # [OPT] Optimizaciones de Compilador
 [profile.release]
 opt-level = 3       # Máxima optimización

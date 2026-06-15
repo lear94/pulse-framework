@@ -1,5 +1,7 @@
 pub mod authenticator;
 pub mod jwt;
+#[cfg(feature = "ldap")]
+pub mod ldap;
 pub mod revocation;
 
 use async_trait::async_trait;
