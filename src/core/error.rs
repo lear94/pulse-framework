@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("Database error: {0}")]
-    DbError(#[from] sea_orm::DbErr),
+    DbError(String),
     #[error("Validation error: {0}")]
     ValidationError(String),
     #[error("Resource not found")]

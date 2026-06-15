@@ -285,7 +285,7 @@ async fn list_users(
 ) -> Result<impl Responder, AppError> {
     let result = UserService::find_all(&state, info.into_inner())
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -341,7 +341,7 @@ async fn create_user(
                 .failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RecoveryService::capture_failure(&state, "create_user", payload, e.to_string()).await;
-            let app_error = AppError::DbError(e);
+            let app_error = AppError::from(e);
             app_error.error_response()
         }
     }

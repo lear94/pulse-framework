@@ -132,7 +132,7 @@ async fn list_pages(
 ) -> Result<impl Responder, AppError> {
     let result = PageService::list(state.db.as_ref(), &query.into_inner())
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -153,7 +153,7 @@ async fn get_page(
     // 2) Base de datos.
     let page = PageService::get_by_slug(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
 
     // 3) Repuebla la caché (best-effort: un fallo de caché no rompe la lectura).
@@ -190,7 +190,7 @@ async fn create_page(
 
     if PageService::exists(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
     {
         return Err(AppError::Conflict(format!("slug '{slug}' already exists")));
     }
@@ -198,7 +198,7 @@ async fn create_page(
     let author = resolve_author(&state, &auth).await;
     let page = PageService::create(state.db.as_ref(), slug, title, content, author)
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
 
     let _ = state.store.set(&cache_key(&page.slug), &page).await;
     Ok(HttpResponse::Created().json(page))
@@ -237,7 +237,7 @@ async fn update_page(
     let editor = resolve_author(&state, &auth).await;
     let updated = PageService::update(state.db.as_ref(), &slug, title, data.content, editor)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
 
     // Invalida la caché: la próxima lectura repuebla con el valor fresco.
@@ -257,7 +257,7 @@ async fn delete_page(
     let slug = slug.into_inner();
     let deleted = PageService::delete(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
     if !deleted {
         return Err(AppError::NotFound);
     }
@@ -278,7 +278,7 @@ async fn search_pages(
     }
     let results = PageService::search(state.db.as_ref(), q.trim())
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(results))
 }
 
@@ -290,11 +290,11 @@ async fn list_revisions(
 ) -> Result<impl Responder, AppError> {
     let page = PageService::get_by_slug(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
     let revisions = PageService::list_revisions(state.db.as_ref(), page.id)
         .await
-        .map_err(AppError::DbError)?;
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(revisions))
 }
 
@@ -307,11 +307,11 @@ async fn get_revision(
     let (slug, rev) = path.into_inner();
     let page = PageService::get_by_slug(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
     let revision = PageService::get_revision(state.db.as_ref(), page.id, rev)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
     Ok(HttpResponse::Ok().json(revision))
 }
@@ -328,11 +328,11 @@ async fn restore_revision(
     let (slug, rev) = path.into_inner();
     let page = PageService::get_by_slug(state.db.as_ref(), &slug)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
     let snapshot = PageService::get_revision(state.db.as_ref(), page.id, rev)
         .await
-        .map_err(AppError::DbError)?
+        .map_err(AppError::from)?
         .ok_or(AppError::NotFound)?;
 
     // Restaurar = aplicar el contenido de la revisión como una nueva edición
@@ -346,7 +346,7 @@ async fn restore_revision(
         editor,
     )
     .await
-    .map_err(AppError::DbError)?
+    .map_err(AppError::from)?
     .ok_or(AppError::NotFound)?;
 
     let _ = state.store.del(&cache_key(&slug)).await;
