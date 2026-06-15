@@ -7,9 +7,23 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DbErr, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, Set,
 };
+use std::sync::OnceLock;
 use tracing::warn;
 
 pub struct UserService;
+
+/// Hash bcrypt de referencia (coste por defecto) para ejecutar `verify` aun
+/// cuando el usuario no existe, igualando la latencia del login y evitando un
+/// oráculo de temporización para enumerar usernames. Se calcula una sola vez.
+fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        // Fallback degenerado solo si bcrypt fallara aquí (nunca en la práctica);
+        // un hash malformado hace que `verify` devuelva Err -> tratado como no-match.
+        bcrypt::hash("pulse-timing-equalizer", bcrypt::DEFAULT_COST)
+            .unwrap_or_else(|_| "$invalid$".to_string())
+    })
+}
 
 impl UserService {
     /// ¿Existe ya un usuario con ese username o email? Para devolver 409 antes
@@ -34,9 +48,21 @@ impl UserService {
             .filter(user::Column::Username.eq(username))
             .one(state.db.as_ref())
             .await
-            .ok()??;
-        match bcrypt::verify(&password, &user.password_hash) {
-            Ok(true) => Some(user.id.to_string()),
+            .ok()
+            .flatten();
+        // Siempre ejecutamos bcrypt::verify (contra el hash real o uno dummy) en
+        // un hilo bloqueante: es CPU-bound y ahogaría el executor async. Verificar
+        // incluso sin usuario iguala la latencia (anti enumeración).
+        let (hash, user_id) = match user {
+            Some(u) => (u.password_hash, Some(u.id.to_string())),
+            None => (dummy_hash().to_string(), None),
+        };
+        let matched =
+            tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash).unwrap_or(false))
+                .await
+                .unwrap_or(false);
+        match (matched, user_id) {
+            (true, Some(id)) => Some(id),
             _ => None,
         }
     }
@@ -47,10 +73,13 @@ impl UserService {
         email: String,
         password: String,
     ) -> TxResult<user::Model> {
-        // Hasheamos fuera de la transacción (operación CPU-bound, no debe
-        // mantener una conexión de BD ocupada).
-        let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
-            .map_err(|e| DbErr::Custom(format!("password hashing failed: {e}")))?;
+        // Hasheamos fuera de la transacción y en un hilo bloqueante: bcrypt es
+        // CPU-bound (~decenas de ms) y bloquearía un worker del executor async.
+        let password_hash =
+            tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+                .await
+                .map_err(|e| DbErr::Custom(format!("hash task join failed: {e}")))?
+                .map_err(|e| DbErr::Custom(format!("password hashing failed: {e}")))?;
 
         let execution_result = AtomicFlow::run(state.db.as_ref(), |txn| {
             // [OPT] Movemos los strings dentro del closure (Zero-Copy)

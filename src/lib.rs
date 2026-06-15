@@ -20,15 +20,21 @@ pub use utoipa;
 pub use utoipa_swagger_ui;
 pub use uuid;
 
+use crate::auth::authenticator::{Authenticator, DbAuthenticator};
 use crate::auth::jwt::JwtProvider;
 use crate::auth::revocation::{MemoryRevocationStore, RedisRevocationStore, RevocationStore};
 use crate::auth::IdentityProvider;
 use crate::core::blackbox::{
     db::DbRecorder, disk::DiskRecorder, FallbackFlightRecorder, FlightRecorder,
 };
-use crate::core::orchestrator::Orchestrator;
-use crate::core::queue::{memory::MemoryQueue, redis::RedisQueue, TaskQueue};
-use crate::core::ratelimit::RateLimiter;
+use crate::core::orchestrator::{redis::RedisCoordinator, Orchestrator};
+use crate::core::queue::{
+    memory::MemoryQueue,
+    redis::{RedisQueue, REAP_INTERVAL_SECS},
+    JobHandlers, TaskQueue,
+};
+use crate::core::ratelimit::{MemoryRateLimiter, RateLimit, RedisRateLimiter};
+use crate::services::recovery_service::RecoveryService;
 use crate::pulse::{memory::MemoryReactor, redis::RedisReactor, PulseReactor};
 use crate::state::AppState;
 use crate::store::{memory::MemoryBackend, redis::RedisBackend, CacheBackend, HybridStore};
@@ -48,6 +54,31 @@ pub struct PulseConfig {
     pub host: String,
     pub port: u16,
     pub db_max_connections: u32,
+    /// Handlers de jobs indexados por `task_type`. El worker despacha cada job
+    /// dequeued a su handler; un `task_type` sin handler se descarta (con warn)
+    /// para no quedar reintentándolo indefinidamente.
+    pub handlers: JobHandlers,
+    /// Verificación de credenciales (el "método de login"). `None` → BD por
+    /// defecto ([`DbAuthenticator`]). Inyecta aquí AD/LDAP/otra tabla.
+    pub authenticator: Option<Arc<dyn Authenticator>>,
+    /// Emisión/validación de tokens. `None` → JWT (`JwtProvider`) configurado
+    /// desde el entorno (`JWT_SECRET`, TTLs). Inyecta aquí para tokens propios.
+    pub auth_provider: Option<Arc<dyn IdentityProvider>>,
+}
+
+impl Default for PulseConfig {
+    fn default() -> Self {
+        Self {
+            database_url: String::new(),
+            redis_url: None,
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            db_max_connections: 10,
+            handlers: JobHandlers::default(),
+            authenticator: None,
+            auth_provider: None,
+        }
+    }
 }
 
 pub async fn bootstrap<F>(
@@ -56,8 +87,9 @@ pub async fn bootstrap<F>(
     openapi: utoipa::openapi::OpenApi,
 ) -> std::io::Result<()>
 where
-    F: FnOnce(&mut web::ServiceConfig) + Send + Copy + 'static,
+    F: Fn(&mut web::ServiceConfig) + Send + Clone + 'static,
 {
+    use std::io::{Error, ErrorKind};
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
@@ -72,7 +104,7 @@ where
 
     let db_conn = Database::connect(opt)
         .await
-        .expect("Failed to connect to DB");
+        .map_err(|e| Error::other(format!("Failed to connect to DB: {e}")))?;
     let db = Arc::new(db_conn);
 
     let redis_pool = match config.redis_url.clone() {
@@ -109,7 +141,8 @@ where
 
     let orchestrator = if let Some(pool) = redis_pool.clone() {
         info!("🧠 Orchestrator: Initializing Distributed Brain.");
-        let orch = Arc::new(Orchestrator::new(pool, queue.clone()));
+        let coordinator = Arc::new(RedisCoordinator::new(pool));
+        let orch = Arc::new(Orchestrator::new(coordinator, queue.clone()));
         orch.clone().start().await;
         Some(orch)
     } else {
@@ -117,23 +150,44 @@ where
         None
     };
 
-    // El secret JWT NO tiene default: arrancar con un valor conocido permitiría
-    // forjar tokens. Exigimos uno explícito y razonablemente fuerte.
-    let jwt_secret = std::env::var("JWT_SECRET")
-        .expect("JWT_SECRET must be set (refusing to start with an insecure default)");
-    if jwt_secret.len() < 16 {
-        panic!("JWT_SECRET is too weak: provide at least 16 characters");
-    }
-    let access_ttl: i64 = std::env::var("PULSE_ACCESS_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3600);
-    let refresh_ttl: i64 = std::env::var("PULSE_REFRESH_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7 * 24 * 3600);
-    let auth_provider: Arc<dyn IdentityProvider> =
-        Arc::new(JwtProvider::with_ttls(jwt_secret, access_ttl, refresh_ttl));
+    // IdentityProvider: si la app inyecta el suyo, lo usamos tal cual; si no,
+    // construimos el JWT por defecto desde el entorno. El secret JWT NO tiene
+    // default (arrancar con uno conocido permitiría forjar tokens): se exige
+    // explícito y razonablemente fuerte SOLO cuando usamos el JWT por defecto.
+    let auth_provider: Arc<dyn IdentityProvider> = match config.auth_provider.clone() {
+        Some(custom) => custom,
+        None => {
+            let jwt_secret = std::env::var("JWT_SECRET").map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "JWT_SECRET must be set (refusing to start with an insecure default)",
+                )
+            })?;
+            const MIN_JWT_SECRET_LEN: usize = 16;
+            if jwt_secret.len() < MIN_JWT_SECRET_LEN {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "JWT_SECRET is too weak: provide at least 16 characters",
+                ));
+            }
+            let access_ttl: i64 = std::env::var("PULSE_ACCESS_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600);
+            let refresh_ttl: i64 = std::env::var("PULSE_REFRESH_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(7 * 24 * 3600);
+            Arc::new(JwtProvider::with_ttls(jwt_secret, access_ttl, refresh_ttl))
+        }
+    };
+
+    // Authenticator: el "método de login". BD por defecto; AD/LDAP/otra tabla
+    // si la app lo inyecta.
+    let authenticator: Arc<dyn Authenticator> = config
+        .authenticator
+        .clone()
+        .unwrap_or_else(|| Arc::new(DbAuthenticator));
 
     // Denylist de tokens (logout): distribuida si hay Redis, en memoria si no.
     let revocations: Arc<dyn RevocationStore> = match redis_pool.clone() {
@@ -150,7 +204,12 @@ where
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let rate_limiter = Arc::new(RateLimiter::new(rl_max, Duration::from_secs(rl_window)));
+    // Con Redis el límite es GLOBAL (compartido entre nodos); sin él, por proceso.
+    let rl_window_dur = Duration::from_secs(rl_window);
+    let rate_limiter: Arc<dyn RateLimit> = match redis_pool.clone() {
+        Some(pool) => Arc::new(RedisRateLimiter::new(pool, rl_max, rl_window_dur)),
+        None => Arc::new(MemoryRateLimiter::new(rl_max, rl_window_dur)),
+    };
 
     let db_recorder = Arc::new(DbRecorder::new(db.clone()));
     let disk_recorder = Arc::new(DiskRecorder::new());
@@ -162,12 +221,12 @@ where
         pulse_reactor,
         store,
         auth_provider,
+        authenticator,
         blackbox,
         queue.clone(),
         orchestrator,
         revocations,
         rate_limiter,
-        redis_pool.clone(),
     );
 
     // Recuperación de jobs in-flight de una ejecución anterior (worker caído
@@ -178,11 +237,31 @@ where
         Err(e) => warn!("Failed to recover stale jobs: {}", e),
     }
 
+    // Reaper: solo con Redis. Reclama periódicamente los leases vencidos (jobs de
+    // nodos caídos). En modo memoria NO se ejecuta: `recover_stale` allí vacía
+    // TODO el in-flight y reentregaría el job que este mismo proceso procesa.
+    if redis_pool.is_some() {
+        let reaper_queue = queue.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(REAP_INTERVAL_SECS));
+            loop {
+                tick.tick().await;
+                match reaper_queue.recover_stale().await {
+                    Ok(0) => {}
+                    Ok(n) => warn!("♻️ Reaper re-queued {} stale job(s).", n),
+                    Err(e) => warn!("Reaper failed: {}", e),
+                }
+            }
+        });
+    }
+
     // Canal de apagado: al recibir SIGINT/SIGTERM dejamos de tomar jobs nuevos
     // pero terminamos (y ack) el que esté en curso, evitando perder trabajo.
     let (shutdown_tx, mut worker_shutdown) = tokio::sync::watch::channel(false);
 
     let queue_clone = queue.clone();
+    let worker_handlers = config.handlers;
+    let worker_state = state.clone();
     let worker = tokio::spawn(async move {
         loop {
             if *worker_shutdown.borrow() {
@@ -191,8 +270,33 @@ where
             match queue_clone.dequeue().await {
                 Ok(Some(job)) => {
                     info!("⚙️ Processing Job: {} [{}]", job.id, job.task_type);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    let _ = queue_clone.acknowledge(&job.id).await;
+                    match worker_handlers.get(&job.task_type) {
+                        Some(handler) => match handler.handle(&job).await {
+                            Ok(()) => {
+                                let _ = queue_clone.acknowledge(&job.id).await;
+                            }
+                            Err(e) => {
+                                warn!("Job {} [{}] failed: {}", job.id, job.task_type, e);
+                                RecoveryService::capture_failure(
+                                    &worker_state,
+                                    &job.task_type,
+                                    job.payload.clone(),
+                                    e,
+                                )
+                                .await;
+                                // Ack para no reintentar un job venenoso en bucle;
+                                // queda en el blackbox para replay manual.
+                                let _ = queue_clone.acknowledge(&job.id).await;
+                            }
+                        },
+                        None => {
+                            warn!(
+                                "No handler registered for task_type '{}'; dropping job {}",
+                                job.task_type, job.id
+                            );
+                            let _ = queue_clone.acknowledge(&job.id).await;
+                        }
+                    }
                 }
                 _ => {
                     // Espera 1s o despierta de inmediato si llega el apagado.
@@ -229,6 +333,9 @@ where
         warn!("CORS: no PULSE_CORS_ORIGINS set — cross-origin requests will be denied.");
     }
 
+    // Clonamos el monitor fuera del factory (que mueve `state`) para contabilizar
+    // TODA petición HTTP, no solo un handler concreto.
+    let monitor = state.monitor.clone();
     let server = HttpServer::new(move || {
         let mut cors = Cors::default()
             .allow_any_method()
@@ -238,13 +345,27 @@ where
             cors = cors.allowed_origin(origin.as_str());
         }
 
+        let req_monitor = monitor.clone();
         App::new()
+            .wrap_fn(move |req, srv| {
+                use actix_web::dev::Service as _;
+                use std::sync::atomic::Ordering::Relaxed;
+                let m = req_monitor.clone();
+                m.requests_total.fetch_add(1, Relaxed);
+                m.active_connections.fetch_add(1, Relaxed);
+                let fut = srv.call(req);
+                async move {
+                    let res = fut.await;
+                    m.active_connections.fetch_sub(1, Relaxed);
+                    res
+                }
+            })
             .wrap(middleware::Compress::default())
             .wrap(TracingLogger::default())
             .wrap(cors)
             .wrap(middleware::DefaultHeaders::new().add(("X-Pulse-Version", "3.0-Autonomy")))
             .app_data(web::Data::new(state.clone()))
-            .configure(api_config)
+            .configure(api_config.clone())
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
             )

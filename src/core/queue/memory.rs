@@ -21,6 +21,12 @@ impl MemoryQueue {
     }
 }
 
+impl Default for MemoryQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl TaskQueue for MemoryQueue {
     async fn enqueue(
@@ -36,7 +42,9 @@ impl TaskQueue for MemoryQueue {
             created_at: Utc::now().timestamp(),
             trace_id: trace_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         };
-        let bytes = bincode::serialize(&job).map_err(|e| e.to_string())?;
+        // JSON, no bincode: el payload es `serde_json::Value` y bincode no puede
+        // deserializarlo (requiere `deserialize_any`). JSON round-trip seguro.
+        let bytes = serde_json::to_vec(&job).map_err(|e| e.to_string())?;
         if let Ok(mut q) = self.queue.lock() {
             q.push_back(bytes);
         }
@@ -51,7 +59,7 @@ impl TaskQueue for MemoryQueue {
                 None => return Ok(None),
             }
         };
-        let job: Job = bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
+        let job: Job = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         // Mantenemos el job in-flight hasta el acknowledge (semántica at-least-once,
         // coherente con la cola Redis).
         if let Ok(mut p) = self.processing.lock() {

@@ -3,6 +3,8 @@ pub mod redis;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Job {
@@ -12,6 +14,16 @@ pub struct Job {
     pub created_at: i64,
     pub trace_id: String,
 }
+
+/// Lógica de negocio asociada a un `task_type`. El worker despacha cada job
+/// dequeued a su handler. `Err` se registra en el blackbox para replay manual.
+#[async_trait]
+pub trait JobHandler: Send + Sync {
+    async fn handle(&self, job: &Job) -> Result<(), String>;
+}
+
+/// Registro de handlers indexado por `task_type`.
+pub type JobHandlers = HashMap<String, Arc<dyn JobHandler>>;
 
 #[async_trait]
 pub trait TaskQueue: Send + Sync {

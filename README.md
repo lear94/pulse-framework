@@ -8,21 +8,22 @@ Pulse Framework is designed for mission-critical applications where latency, res
 
 ## 🚀 Performance & Resilience: The "Gauntlet" Benchmarks
 
-Pulse Framework isn't just fast; it is **efficient** and **indestructible**. The following metrics were captured during the **Level 6 System Gauntlet** (CI/CD Stress Test):
+Pulse Framework focuses on **efficiency** and **graceful degradation under failure**. The following numbers come from the **System Gauntlet** load/chaos suite on a local dev machine — treat them as a baseline for that setup, not a universal benchmark.
 
-### 📊 **Throughput & Latency**
-* **4,500+ Requests per Second** on a standard local environment.
-* **47ms Average Latency** under heavy concurrency (200 active connections).
-* Processed **~45,000 requests in 10 seconds** with 99.99% success rate.
+### 📊 **Throughput & Latency** *(local, single node)*
+* ~**4,500 req/s** sustained on a local environment.
+* ~**47 ms** average latency under 200 concurrent connections.
+* ~**45,000 requests in 10 s** with a high success rate.
 
-### 🍃 **Ultra-Low Resource Footprint**
-Unlike managed languages that eat up memory, Pulse remains incredibly lean under stress:
-* **RAM Usage:** Only **33 MB** while handling 4.5k req/s.
-* **CPU Efficiency:** Peaks at **25% usage**, leaving room for background tasks.
+> Auth endpoints are intentionally bounded by **bcrypt** (CPU-bound hashing runs off the async executor via `spawn_blocking`); throughput there is dominated by the configured bcrypt cost, by design.
+
+### 🍃 **Low Resource Footprint**
+* **RAM:** ~**33 MB** resident under the load above.
+* **CPU:** peaks around **25%**, leaving headroom for background work.
 
 ### 🛡️ **Chaos Engineering Ready**
-* **Survival Mode:** The framework automatically detects dependency failures (e.g., Redis crash) and degrades gracefully or recovers without crashing the main process.
-* *Verified Result:* `Chaos: Killing Redis... -> SUCCESS`.
+* **Survival Mode:** dependency failures (e.g. a Redis crash) degrade gracefully or recover without taking down the main process.
+* *Observed in the suite:* `Chaos: Killing Redis... -> SUCCESS`.
 
 ---
 
@@ -84,9 +85,15 @@ Initialize the database schema:
 Bash
 
 ```
-cargo run --bin migration refresh
+cargo run --bin migration up
 
 ```
+
+> **Safety lock:** destructive commands (`fresh`, `refresh`, `reset`) drop tables
+> and are **blocked by default**. To run one intentionally, set
+> `PULSE_ALLOW_DESTRUCTIVE_MIGRATIONS=yes-i-understand-this-drops-tables`
+> (and confirm interactively if on a terminal). Prefer `up`; roll back with
+> `down -n N`.
 
 ### 5. Run the Server
 

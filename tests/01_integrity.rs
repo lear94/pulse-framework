@@ -3,8 +3,9 @@ mod integrity_tests {
     use actix_web::{test, web, App};
     use pulse_core::auth::revocation::MemoryRevocationStore;
     use pulse_core::core::blackbox::{disk::DiskRecorder, FallbackFlightRecorder};
+    use pulse_core::auth::authenticator::DbAuthenticator;
     use pulse_core::core::queue::memory::MemoryQueue;
-    use pulse_core::core::ratelimit::RateLimiter;
+    use pulse_core::core::ratelimit::MemoryRateLimiter;
     use pulse_core::pulse::memory::MemoryReactor;
     use pulse_core::store::{memory::MemoryBackend, HybridStore};
     use pulse_core::{api, auth::jwt::JwtProvider, state::AppState};
@@ -31,6 +32,7 @@ mod integrity_tests {
             MemoryReactor::new(100).0,
             HybridStore::new(Arc::new(MemoryBackend)),
             Arc::new(JwtProvider::new("test_secret_value_long".into())),
+            Arc::new(DbAuthenticator),
             Arc::new(FallbackFlightRecorder::new(
                 Arc::new(DiskRecorder::new()),
                 Arc::new(DiskRecorder::new()),
@@ -38,8 +40,7 @@ mod integrity_tests {
             Arc::new(MemoryQueue::new()),
             None,
             Arc::new(MemoryRevocationStore::new()),
-            Arc::new(RateLimiter::new(TEST_RATE_MAX, Duration::from_secs(60))),
-            None,
+            Arc::new(MemoryRateLimiter::new(TEST_RATE_MAX, Duration::from_secs(60))),
         )
     }
 

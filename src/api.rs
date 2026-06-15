@@ -1,4 +1,4 @@
-use crate::auth::{AdminClaims, Claims};
+use crate::auth::Claims;
 use crate::core::blackbox::FlightRecord;
 use crate::core::error::AppError;
 use crate::core::monitor::MonitorSnapshot;
@@ -8,8 +8,117 @@ use crate::models::user;
 use crate::services::recovery_service::RecoveryService;
 use crate::services::user_service::UserService;
 use crate::state::AppState;
-use actix_web::{web, HttpRequest, HttpResponse, Responder, ResponseError};
+use actix_web::{
+    dev::Payload,
+    error::{ErrorForbidden, ErrorUnauthorized},
+    http::StatusCode,
+    web, FromRequest, HttpRequest, HttpResponse, Responder, ResponseError,
+};
+use serde::Serialize;
+use std::future::Future;
+use std::pin::Pin;
 use utoipa::OpenApi;
+
+// --- Cuarentena de Actix --------------------------------------------------
+// Todo el acoplamiento HTTP (extractores y mapeo de errores) vive AQUÍ, en la
+// capa `api`. El dominio (`auth::Claims`, `core::AppError`) es transport-agnostic.
+
+/// Mapeo de `AppError` (dominio) → respuesta HTTP. `ResponseError` es de Actix;
+/// el `impl` para un tipo del crate es legal por la regla de orfandad.
+#[derive(Serialize)]
+struct ErrorResponse {
+    code: u16,
+    message: String,
+}
+
+impl ResponseError for AppError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::DbError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        let status = self.status_code();
+        HttpResponse::build(status).json(ErrorResponse {
+            code: status.as_u16(),
+            message: self.to_string(),
+        })
+    }
+}
+
+/// Extractor: exige un access token JWT válido y no revocado.
+impl FromRequest for Claims {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        let req = req.clone();
+        Box::pin(async move {
+            let state = req
+                .app_data::<web::Data<AppState>>()
+                .ok_or_else(|| ErrorUnauthorized("App state not found"))?;
+
+            let auth_header = req.headers().get("Authorization");
+
+            match auth_header {
+                Some(auth_val) => {
+                    let auth_str = auth_val.to_str().unwrap_or("");
+                    if !auth_str.starts_with("Bearer ") {
+                        return Err(ErrorUnauthorized("Invalid token format"));
+                    }
+                    let token = &auth_str[7..];
+
+                    let claims = state
+                        .auth
+                        .verify_token(token)
+                        .await
+                        .map_err(|_| ErrorUnauthorized("Invalid or expired token"))?;
+
+                    // Solo los access tokens autorizan endpoints; un refresh
+                    // token no debe usarse como credencial de API.
+                    if !claims.is_access() {
+                        return Err(ErrorUnauthorized(
+                            "Refresh tokens cannot be used to access APIs",
+                        ));
+                    }
+                    // Denylist: tokens revocados (logout) dejan de valer.
+                    if !claims.jti.is_empty() && state.revocations.is_revoked(&claims.jti).await {
+                        return Err(ErrorUnauthorized("Token has been revoked"));
+                    }
+                    Ok(claims)
+                }
+                None => Err(ErrorUnauthorized("Missing Authorization header")),
+            }
+        })
+    }
+}
+
+/// Extractor que exige un JWT válido **con el rol `admin`**.
+/// Las rutas administrativas deben usar este extractor en lugar de `Claims`.
+pub struct AdminClaims(pub Claims);
+
+impl FromRequest for AdminClaims {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
+
+    fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
+        let claims_fut = Claims::from_request(req, payload);
+        Box::pin(async move {
+            let claims = claims_fut.await?;
+            if claims.has_role("admin") {
+                Ok(AdminClaims(claims))
+            } else {
+                Err(ErrorForbidden("Admin role required"))
+            }
+        })
+    }
+}
+// --- fin cuarentena -------------------------------------------------------
 
 #[derive(OpenApi)]
 #[openapi(
@@ -53,7 +162,11 @@ pub struct RefreshRequest {
 /// Deriva los roles a partir de la allowlist `PULSE_ADMIN_USERS`
 /// (lista separada por comas). Por defecto todo usuario es `user`;
 /// nunca se concede `admin` automáticamente.
-fn resolve_roles(username: &str) -> Vec<String> {
+///
+/// NOTA: los roles se hornean en el JWT en el momento de emisión. Cambiar
+/// `PULSE_ADMIN_USERS` solo afecta a tokens NUEVOS; un token ya emitido conserva
+/// sus roles hasta expirar (o hasta revocarlo vía logout/denylist).
+pub(crate) fn resolve_roles(username: &str) -> Vec<String> {
     let is_admin = std::env::var("PULSE_ADMIN_USERS")
         .unwrap_or_default()
         .split(',')
@@ -92,16 +205,27 @@ async fn login(
     if !state
         .rate_limiter
         .check(&format!("login:{}", client_ip(&req)))
+        .await
     {
         return HttpResponse::TooManyRequests()
             .json(serde_json::json!({ "error": "too many login attempts" }));
     }
 
-    match UserService::login(&state, body.username.clone(), body.password.clone()).await {
-        Some(user_id) => {
-            let roles = resolve_roles(&body.username);
-            let access = state.auth.create_token(&user_id, roles.clone()).await;
-            let refresh_tok = state.auth.create_refresh_token(&user_id, roles).await;
+    // El "método de login" es enchufable (BD por defecto, AD/LDAP/otra tabla si
+    // la app inyecta su propio `Authenticator`). Tras verificar credenciales,
+    // Pulse emite SU token con los roles que devuelva el authenticator.
+    match state
+        .authenticator
+        .authenticate(&state, &body.username, &body.password)
+        .await
+    {
+        Some(outcome) => {
+            let user_id = outcome.user_id;
+            let access = state
+                .auth
+                .create_token(&user_id, outcome.roles.clone())
+                .await;
+            let refresh_tok = state.auth.create_refresh_token(&user_id, outcome.roles).await;
             match (access, refresh_tok) {
                 (Ok(access), Ok(refresh_tok)) => HttpResponse::Ok().json(serde_json::json!({
                     // "token" se mantiene por compatibilidad con clientes previos.
@@ -171,15 +295,11 @@ async fn create_user(
     state: web::Data<AppState>,
     form: web::Json<CreateUserRequest>,
 ) -> impl Responder {
-    state
-        .monitor
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     // Registro público pero limitado por IP para evitar abuso/spam.
     if !state
         .rate_limiter
         .check(&format!("register:{}", client_ip(&http)))
+        .await
     {
         return AppError::RateLimited.error_response();
     }
@@ -227,41 +347,28 @@ async fn create_user(
     }
 }
 
-async fn ping_redis(pool: &deadpool_redis::Pool) -> bool {
-    match pool.get().await {
-        Ok(mut conn) => {
-            let res: Result<String, _> = deadpool_redis::redis::cmd("PING")
-                .query_async(&mut conn)
-                .await;
-            matches!(res, Ok(ref pong) if pong == "PONG")
-        }
-        Err(_) => false,
-    }
-}
-
 #[utoipa::path(get, path = "/api/v1/health", responses((status = 200, description = "Operational"), (status = 503, description = "Degraded")))]
 async fn health_check(state: web::Data<AppState>) -> impl Responder {
     let db_ok = state.db.as_ref().ping().await.is_ok();
-    // None = Redis no configurado (modo local) → no penaliza la salud.
-    let redis_ok = match &state.redis_pool {
-        Some(pool) => ping_redis(pool).await,
-        None => true,
-    };
+    // None = backend remoto no configurado (modo local) → no penaliza la salud.
+    let backend_health = state.store.health().await;
+    let backend_ok = backend_health.unwrap_or(true);
     let local_cache_size = state.store.local_count();
 
     let body = serde_json::json!({
-        "status": if db_ok && redis_ok { "operational" } else { "degraded" },
+        "status": if db_ok && backend_ok { "operational" } else { "degraded" },
         "checks": {
             "database": if db_ok { "up" } else { "down" },
-            "redis": match &state.redis_pool {
-                Some(_) => if redis_ok { "up" } else { "down" },
+            "backend": match backend_health {
+                Some(true) => "up",
+                Some(false) => "down",
                 None => "disabled",
             },
         },
         "local_cache_entries": local_cache_size,
     });
 
-    if db_ok && redis_ok {
+    if db_ok && backend_ok {
         HttpResponse::Ok().json(body)
     } else {
         HttpResponse::ServiceUnavailable().json(body)

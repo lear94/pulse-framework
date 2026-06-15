@@ -3,7 +3,6 @@ pub mod redis;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use deadpool_redis::{redis::RedisError, PoolError};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use tokio::task;
@@ -11,12 +10,12 @@ use tracing::{debug, error};
 
 pub type HybridResult<T> = Result<T, HybridError>;
 
+/// Error del store agnóstico al backend: ni Redis ni ningún driver concreto
+/// aparece en la firma pública. Cada backend mapea sus errores a `Backend`.
 #[derive(thiserror::Error, Debug)]
 pub enum HybridError {
-    #[error("Backend connection error: {0}")]
-    Pool(#[from] PoolError),
-    #[error("Backend command error: {0}")]
-    Redis(#[from] RedisError),
+    #[error("Backend error: {0}")]
+    Backend(String),
     #[error("Serialization error: {0}")]
     Serde(#[from] bincode::Error),
     #[error("Backend is not available")]
@@ -31,6 +30,9 @@ pub trait CacheBackend: Send + Sync {
     async fn set(&self, key: &str, value: &[u8]) -> HybridResult<()>;
     async fn del(&self, key: &str) -> HybridResult<()>;
     async fn subscribe_to_invalidations(&self, local_cache: Arc<DashMap<String, Vec<u8>>>);
+    /// Estado del backend para `/health`. `None` = backend local sin dependencia
+    /// externa (no penaliza la salud); `Some(true/false)` = alcanzable o no.
+    async fn health(&self) -> Option<bool>;
 }
 
 #[derive(Clone)]
@@ -108,5 +110,10 @@ impl HybridStore {
 
     pub fn local_count(&self) -> usize {
         self.local_data.len()
+    }
+
+    /// Salud del backend remoto (ver [`CacheBackend::health`]).
+    pub async fn health(&self) -> Option<bool> {
+        self.backend.health().await
     }
 }

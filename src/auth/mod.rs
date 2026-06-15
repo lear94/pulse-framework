@@ -1,16 +1,9 @@
+pub mod authenticator;
 pub mod jwt;
 pub mod revocation;
 
-use crate::state::AppState;
-use actix_web::{
-    dev::Payload,
-    error::{ErrorForbidden, ErrorUnauthorized},
-    web, FromRequest, HttpRequest,
-};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -76,71 +69,4 @@ pub trait IdentityProvider: Send + Sync {
         roles: Vec<String>,
     ) -> Result<String, AuthError>;
     async fn verify_token(&self, token: &str) -> Result<Claims, AuthError>;
-}
-
-impl FromRequest for Claims {
-    type Error = actix_web::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
-
-    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
-        let req = req.clone();
-        Box::pin(async move {
-            let state = req
-                .app_data::<web::Data<AppState>>()
-                .ok_or_else(|| ErrorUnauthorized("App state not found"))?;
-
-            let auth_header = req.headers().get("Authorization");
-
-            match auth_header {
-                Some(auth_val) => {
-                    let auth_str = auth_val.to_str().unwrap_or("");
-                    if !auth_str.starts_with("Bearer ") {
-                        return Err(ErrorUnauthorized("Invalid token format"));
-                    }
-                    let token = &auth_str[7..];
-
-                    let claims = state
-                        .auth
-                        .verify_token(token)
-                        .await
-                        .map_err(|_| ErrorUnauthorized("Invalid or expired token"))?;
-
-                    // Solo los access tokens autorizan endpoints; un refresh
-                    // token no debe usarse como credencial de API.
-                    if !claims.is_access() {
-                        return Err(ErrorUnauthorized(
-                            "Refresh tokens cannot be used to access APIs",
-                        ));
-                    }
-                    // Denylist: tokens revocados (logout) dejan de valer.
-                    if !claims.jti.is_empty() && state.revocations.is_revoked(&claims.jti).await {
-                        return Err(ErrorUnauthorized("Token has been revoked"));
-                    }
-                    Ok(claims)
-                }
-                None => Err(ErrorUnauthorized("Missing Authorization header")),
-            }
-        })
-    }
-}
-
-/// Extractor que exige un JWT válido **con el rol `admin`**.
-/// Las rutas administrativas deben usar este extractor en lugar de `Claims`.
-pub struct AdminClaims(pub Claims);
-
-impl FromRequest for AdminClaims {
-    type Error = actix_web::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
-
-    fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
-        let claims_fut = Claims::from_request(req, payload);
-        Box::pin(async move {
-            let claims = claims_fut.await?;
-            if claims.has_role("admin") {
-                Ok(AdminClaims(claims))
-            } else {
-                Err(ErrorForbidden("Admin role required"))
-            }
-        })
-    }
 }

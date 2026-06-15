@@ -206,10 +206,11 @@ async fn health() -> impl pulse_core::actix_web::Responder { "System Operational
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     pulse_core::dotenvy::dotenv().ok();
-    let config = PulseConfig { 
-        database_url: std::env::var("DATABASE_URL").expect("DB_URL required"),
+    let config = PulseConfig {
+        database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL required"), // allow-unwrap
         redis_url: std::env::var("REDIS_URL").ok(),
-        host: "0.0.0.0".to_string(), port: 8080 
+        host: "0.0.0.0".to_string(), port: 8080,
+        db_max_connections: 10
     };
     bootstrap(config, routes, ApiDoc::openapi()).await
 }

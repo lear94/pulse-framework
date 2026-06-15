@@ -1,0 +1,32 @@
+[package]
+name = "wiki"
+version = "0.1.0"
+edition = "2021"
+
+# `[workspace]` vacío a propósito: la wiki es un crate INDEPENDIENTE que consume
+# `pulse_core` como path-dependency, tal y como haría cualquier aplicación real.
+# Así no entra en el workspace del framework (su `cargo build`/CI no la compila)
+# y mantiene su propio Cargo.lock. Es el mismo patrón que `pulse-cli new`.
+[workspace]
+
+[dependencies]
+# El núcleo del framework.
+pulse_core = { path = "../.." }
+
+# Dependencias declaradas DIRECTAMENTE con las mismas versiones que el core: Cargo
+# unifica cada crate (actix-web, sea-orm, serde…) a una sola instancia en el grafo,
+# así los tipos cruzan la frontera lib<->app sin conflictos (p.ej. `web::ServiceConfig`
+# y `DatabaseConnection` son los mismos que usa `bootstrap`).
+actix-web = "4.12.1"
+tokio = { version = "1.48", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+utoipa = { version = "5.4", features = ["actix_extras", "uuid"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+async-trait = "0.1.89"
+# sea-orm directo: necesitamos sus macros de entidad (DeriveEntityModel). Mismo
+# backend (native-tls) que el core para no duplicar la compilación de sea-orm.
+sea-orm = { version = "1.1.19", features = ["sqlx-postgres", "runtime-tokio-native-tls", "macros"] }
+# Para hashear la contraseña del usuario admin sembrado al arrancar (demo).
+bcrypt = "0.15"

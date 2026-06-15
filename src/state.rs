@@ -1,13 +1,13 @@
+use crate::auth::authenticator::Authenticator;
 use crate::auth::revocation::RevocationStore;
 use crate::auth::IdentityProvider;
 use crate::core::blackbox::FlightRecorder;
 use crate::core::monitor::SystemMonitor;
 use crate::core::orchestrator::Orchestrator;
 use crate::core::queue::TaskQueue;
-use crate::core::ratelimit::RateLimiter;
+use crate::core::ratelimit::RateLimit;
 use crate::pulse::PulseReactor;
 use crate::store::HybridStore;
-use deadpool_redis::Pool;
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 
@@ -18,13 +18,14 @@ pub struct AppState {
     pub store: HybridStore,
     pub monitor: Arc<SystemMonitor>,
     pub auth: Arc<dyn IdentityProvider>,
+    /// Verificador de credenciales (login). BD por defecto; sustituible por
+    /// AD/LDAP/otra fuente vía `PulseConfig::authenticator`.
+    pub authenticator: Arc<dyn Authenticator>,
     pub blackbox: Arc<dyn FlightRecorder>,
     pub queue: Arc<dyn TaskQueue>,
     pub orchestrator: Option<Arc<Orchestrator>>,
     pub revocations: Arc<dyn RevocationStore>,
-    pub rate_limiter: Arc<RateLimiter>,
-    /// Pool de Redis para chequeos de salud (None en modo local).
-    pub redis_pool: Option<Pool>,
+    pub rate_limiter: Arc<dyn RateLimit>,
 }
 
 impl AppState {
@@ -34,12 +35,12 @@ impl AppState {
         pulse: Arc<dyn PulseReactor>,
         store: HybridStore,
         auth: Arc<dyn IdentityProvider>,
+        authenticator: Arc<dyn Authenticator>,
         blackbox: Arc<dyn FlightRecorder>,
         queue: Arc<dyn TaskQueue>,
         orchestrator: Option<Arc<Orchestrator>>,
         revocations: Arc<dyn RevocationStore>,
-        rate_limiter: Arc<RateLimiter>,
-        redis_pool: Option<Pool>,
+        rate_limiter: Arc<dyn RateLimit>,
     ) -> Self {
         Self {
             db,
@@ -47,12 +48,12 @@ impl AppState {
             store,
             monitor: SystemMonitor::new(),
             auth,
+            authenticator,
             blackbox,
             queue,
             orchestrator,
             revocations,
             rate_limiter,
-            redis_pool,
         }
     }
 }

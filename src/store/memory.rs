@@ -17,4 +17,7 @@ impl CacheBackend for MemoryBackend {
         Ok(())
     }
     async fn subscribe_to_invalidations(&self, _local_cache: Arc<DashMap<String, Vec<u8>>>) {}
+    async fn health(&self) -> Option<bool> {
+        None // Sin dependencia externa: modo local.
+    }
 }

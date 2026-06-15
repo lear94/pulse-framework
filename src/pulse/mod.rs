@@ -8,9 +8,6 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PulseSignal {
     UserCreated(String),
-    SystemAlert(String),
-    CacheInvalidated(String),
-    Heartbeat { node_id: String, timestamp: i64 },
 }
 
 #[async_trait]

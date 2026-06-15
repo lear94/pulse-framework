@@ -18,6 +18,12 @@ impl DiskRecorder {
     }
 }
 
+impl Default for DiskRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl FlightRecorder for DiskRecorder {
     async fn record(&self, record: FlightRecord) -> Result<(), String> {

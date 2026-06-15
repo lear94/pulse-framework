@@ -1,11 +1,29 @@
 use super::{Job, TaskQueue};
 use async_trait::async_trait;
 use chrono::Utc;
-use deadpool_redis::{redis::AsyncCommands, Pool};
+use deadpool_redis::{redis::AsyncCommands, redis::Script, Pool};
 use uuid::Uuid;
 
-const QUEUE_KEY: &str = "pulse:queue:jobs";
-const PROCESSING_KEY: &str = "pulse:queue:processing";
+// Cola fiable estilo "visibility timeout" (semántica SQS / at-least-once):
+//   - READY_KEY  (list): ids pendientes. LPUSH a la izquierda, RPOP a la derecha → FIFO.
+//   - JOBS_KEY   (hash): id → bytes del Job (bincode). Una sola copia del payload.
+//   - INFLIGHT_KEY (zset): id → instante límite del lease (epoch secs). Un job
+//     dequeued vive aquí hasta su ACK; si su lease vence sin ACK (worker caído),
+//     `recover_stale` lo devuelve a READY. Por nodo NO hay clave separada: el
+//     lease por-job evita que un nodo reinyecte jobs que otros nodos procesan.
+const READY_KEY: &str = "pulse:queue:ready";
+const JOBS_KEY: &str = "pulse:queue:store";
+const INFLIGHT_KEY: &str = "pulse:queue:inflight";
+
+/// Ventana de visibilidad: tiempo máximo que un job puede estar in-flight sin
+/// ACK antes de considerarse abandonado y reencolarse. Debe superar con holgura
+/// la duración del handler más lento; si un handler tarda más, el job podría
+/// reentregarse (at-least-once, los handlers deben ser idempotentes).
+pub const VISIBILITY_TIMEOUT_SECS: i64 = 300;
+
+/// Periodicidad del reaper (reclamación de leases vencidos). << visibilidad para
+/// recuperar pronto el trabajo de un nodo caído sin re-disparar jobs vivos.
+pub const REAP_INTERVAL_SECS: u64 = 60;
 
 pub struct RedisQueue {
     pool: Pool,
@@ -33,11 +51,17 @@ impl TaskQueue for RedisQueue {
             created_at: Utc::now().timestamp(),
             trace_id: trace_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         };
-        // [OPT] Serialización binaria para Redis
-        let bytes = bincode::serialize(&job).map_err(|e| e.to_string())?;
-        // FIFO: encolamos por la izquierda (LPUSH) y consumimos por la derecha (RPOPLPUSH).
+        // JSON, no bincode: el payload es `serde_json::Value` y bincode no puede
+        // deserializarlo (requiere `deserialize_any`). JSON round-trip seguro.
+        let bytes = serde_json::to_vec(&job).map_err(|e| e.to_string())?;
+        // Guardamos el payload ANTES de publicar el id: si fallara entre ambos,
+        // un id sin payload se descarta limpiamente en dequeue.
         let _: () = conn
-            .lpush(QUEUE_KEY, bytes)
+            .hset(JOBS_KEY, &job.id, bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _: () = conn
+            .lpush(READY_KEY, &job.id)
             .await
             .map_err(|e| e.to_string())?;
         Ok(job.id)
@@ -45,14 +69,30 @@ impl TaskQueue for RedisQueue {
 
     async fn dequeue(&self) -> Result<Option<Job>, String> {
         let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
-        // Redis devuelve bytes
-        let result: Option<Vec<u8>> = conn
-            .rpoplpush(QUEUE_KEY, PROCESSING_KEY)
+        // Atómico: saca un id de READY, fija su lease en INFLIGHT y devuelve los
+        // bytes. Sin ventana de carrera entre pop y registro del lease.
+        let lease_deadline = Utc::now().timestamp() + VISIBILITY_TIMEOUT_SECS;
+        let script = Script::new(
+            r"
+            local id = redis.call('RPOP', KEYS[1])
+            if not id then return false end
+            local data = redis.call('HGET', KEYS[2], id)
+            if not data then return false end
+            redis.call('ZADD', KEYS[3], ARGV[1], id)
+            return data
+            ",
+        );
+        let result: Option<Vec<u8>> = script
+            .key(READY_KEY)
+            .key(JOBS_KEY)
+            .key(INFLIGHT_KEY)
+            .arg(lease_deadline)
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
         match result {
             Some(bytes) => {
-                let job: Job = bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
+                let job: Job = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
                 Ok(Some(job))
             }
             None => Ok(None),
@@ -61,43 +101,47 @@ impl TaskQueue for RedisQueue {
 
     async fn acknowledge(&self, job_id: &str) -> Result<(), String> {
         let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
-        // Para ack, necesitamos iterar. Esto es costoso en binario sin índices, pero aceptable para colas medianas.
-        // En un sistema V7, usaríamos ZSETs para esto.
-        // Por ahora mantenemos la lógica pero deserializamos.
-        let pending: Vec<Vec<u8>> = conn
-            .lrange(PROCESSING_KEY, 0, -1)
+        // O(1): quita el lease y borra el payload. (Antes era O(n) por LRANGE.)
+        let script = Script::new(
+            r"
+            redis.call('ZREM', KEYS[1], ARGV[1])
+            redis.call('HDEL', KEYS[2], ARGV[1])
+            return 1
+            ",
+        );
+        let _: i64 = script
+            .key(INFLIGHT_KEY)
+            .key(JOBS_KEY)
+            .arg(job_id)
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
-        for bytes in pending {
-            if let Ok(job) = bincode::deserialize::<Job>(&bytes) {
-                if job.id == job_id {
-                    let _: () = conn
-                        .lrem(PROCESSING_KEY, 1, bytes)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    return Ok(());
-                }
-            }
-        }
         Ok(())
     }
 
     async fn recover_stale(&self) -> Result<usize, String> {
-        // Recuperación de jobs in-flight: si un worker murió tras el dequeue
-        // (RPOPLPUSH) pero antes del acknowledge, el job quedó atascado en
-        // PROCESSING_KEY. Lo movemos atómicamente de vuelta a la cola.
+        // Reclama SOLO los leases vencidos (deadline <= ahora): jobs cuyo worker
+        // murió entre dequeue y ACK. Los jobs que otros nodos procesan ahora
+        // tienen lease futuro y NO se tocan → seguro en multi-nodo.
         let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
-        let mut count = 0usize;
-        loop {
-            let moved: Option<Vec<u8>> = conn
-                .rpoplpush(PROCESSING_KEY, QUEUE_KEY)
-                .await
-                .map_err(|e| e.to_string())?;
-            match moved {
-                Some(_) => count += 1,
-                None => break,
-            }
-        }
+        let now = Utc::now().timestamp();
+        let script = Script::new(
+            r"
+            local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            for _, id in ipairs(ids) do
+                redis.call('ZREM', KEYS[1], id)
+                redis.call('LPUSH', KEYS[2], id)
+            end
+            return #ids
+            ",
+        );
+        let count: usize = script
+            .key(INFLIGHT_KEY)
+            .key(READY_KEY)
+            .arg(now)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(count)
     }
 }
