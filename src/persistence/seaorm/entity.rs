@@ -1,3 +1,9 @@
+//! Entidad de persistencia SeaORM del agregado `User`.
+//!
+//! Mapeo tabla↔struct: vive con la implementación del ORM, NO en el dominio.
+//! El dominio usa `persistence::User` (tipo plano). Al portar a otro ORM este
+//! fichero se reemplaza por el mapeo equivalente del nuevo backend.
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::ActiveValue::{NotSet, Set};

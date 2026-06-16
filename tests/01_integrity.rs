@@ -19,7 +19,7 @@ mod integrity_tests {
 
     async fn mock_state() -> AppState {
         let db_conn = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![pulse_core::models::user::Model {
+            .append_query_results(vec![vec![pulse_core::persistence::seaorm::entity::Model {
                 id: uuid::Uuid::new_v4(),
                 username: "admin".to_owned(),
                 email: "admin@test.com".to_owned(),

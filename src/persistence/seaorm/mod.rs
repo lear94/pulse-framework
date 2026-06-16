@@ -1,13 +1,17 @@
 //! Implementación SeaORM de la frontera de persistencia.
 //!
-//! TODO el acoplamiento a SeaORM del dominio `User` vive aquí. Para portar a
-//! otro ORM, duplica este fichero (`persistence/welds.rs`, etc.) implementando
-//! los mismos traits y cámbialo en `bootstrap`. Nada más se toca.
+//! TODO el acoplamiento a SeaORM del dominio `User` vive en este módulo
+//! (`entity` = mapeo de tabla, `support` = helpers de transacción/paginación).
+//! Para portar a otro ORM, duplica este directorio (`persistence/welds/`, etc.)
+//! implementando los mismos traits y cámbialo en `bootstrap`. Nada más se toca.
 
+pub mod entity;
+mod support;
+
+use self::entity::{self as user, Entity as UserEntity};
+use self::support::{AtomicFlow, Paginable};
 use super::{Datastore, NewUser, RepoError, RepoResult, User, UserRepository};
-use crate::core::query::{PageParams, Paginable, PaginatedResult};
-use crate::core::transaction::AtomicFlow;
-use crate::models::user::{self, Entity as UserEntity};
+use crate::core::query::{PageParams, PaginatedResult};
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait,
