@@ -13,10 +13,19 @@ use actix_web::{web, HttpResponse, Responder};
 use pulse_core::auth::Claims;
 use pulse_core::core::error::AppError;
 use pulse_core::core::query::{PageParams, PaginatedResult};
+use pulse_core::persistence::RepoError;
 use pulse_core::state::AppState;
-use sea_orm::EntityTrait;
+use sea_orm::{DatabaseConnection, DbErr, EntityTrait};
 use serde::Deserialize;
 use utoipa::{OpenApi, ToSchema};
+
+/// La conexión es PROPIA de la app: tras desacoplar el ORM, el framework ya no
+/// expone su pool por `AppState`. La inyectamos como `app_data` en `configure`.
+/// El `DbErr` del ORM se traduce a `AppError` por la ruta agnóstica del core
+/// (`DbErr → RepoError → AppError`), sin acoplar la wiki a un mapeo propio.
+fn db_err(e: DbErr) -> AppError {
+    AppError::from(RepoError::from(e))
+}
 
 /// HTML del frontend (SPA en vanilla JS). Se sirve en `/`.
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -60,7 +69,10 @@ const MAX_CONTENT: usize = 100_000;
 
 /// Registra TODAS las rutas: las del core (auth/users/health/metrics/admin), las
 /// de la wiki bajo `/api/wiki`, y el frontend en `/`.
-pub fn configure(cfg: &mut web::ServiceConfig) {
+pub fn configure(cfg: &mut web::ServiceConfig, db: web::Data<DatabaseConnection>) {
+    // La conexión propia de la wiki, disponible para sus handlers vía extractor.
+    cfg.app_data(db);
+
     // Rutas del framework (login/refresh/logout, users, health, metrics, admin…).
     pulse_core::api::config(cfg);
 
@@ -112,10 +124,10 @@ fn slugify(input: &str) -> String {
 }
 
 /// Resuelve el nombre de autor a partir del `sub` (uuid) del JWT.
-async fn resolve_author(state: &AppState, claims: &Claims) -> String {
+async fn resolve_author(db: &DatabaseConnection, claims: &Claims) -> String {
     if let Ok(uid) = uuid::Uuid::parse_str(&claims.sub) {
-        if let Ok(Some(u)) = pulse_core::models::user::Entity::find_by_id(uid)
-            .one(state.db.as_ref())
+        if let Ok(Some(u)) = pulse_core::persistence::seaorm::entity::Entity::find_by_id(uid)
+            .one(db)
             .await
         {
             return u.username;
@@ -127,12 +139,12 @@ async fn resolve_author(state: &AppState, claims: &Claims) -> String {
 #[utoipa::path(get, path = "/api/wiki/pages", params(PageParams),
     responses((status = 200, body = PaginatedResult<model::Model>)))]
 async fn list_pages(
-    state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     query: web::Query<PageParams>,
 ) -> Result<impl Responder, AppError> {
-    let result = PageService::list(state.db.as_ref(), &query.into_inner())
+    let result = PageService::list(db.as_ref(), &query.into_inner())
         .await
-        .map_err(AppError::from)?;
+        .map_err(db_err)?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -140,6 +152,7 @@ async fn list_pages(
     responses((status = 200, body = model::Model), (status = 404, description = "Not found")))]
 async fn get_page(
     state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     slug: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let slug = slug.into_inner();
@@ -151,9 +164,9 @@ async fn get_page(
     }
 
     // 2) Base de datos.
-    let page = PageService::get_by_slug(state.db.as_ref(), &slug)
+    let page = PageService::get_by_slug(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
 
     // 3) Repuebla la caché (best-effort: un fallo de caché no rompe la lectura).
@@ -169,6 +182,7 @@ async fn get_page(
         (status = 401, description = "Unauthorized"), (status = 409, description = "Slug taken")))]
 async fn create_page(
     state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     body: web::Json<CreatePageRequest>,
     auth: Claims,
 ) -> Result<impl Responder, AppError> {
@@ -188,17 +202,17 @@ async fn create_page(
         ));
     }
 
-    if PageService::exists(state.db.as_ref(), &slug)
+    if PageService::exists(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
     {
         return Err(AppError::Conflict(format!("slug '{slug}' already exists")));
     }
 
-    let author = resolve_author(&state, &auth).await;
-    let page = PageService::create(state.db.as_ref(), slug, title, content, author)
+    let author = resolve_author(db.as_ref(), &auth).await;
+    let page = PageService::create(db.as_ref(), slug, title, content, author)
         .await
-        .map_err(AppError::from)?;
+        .map_err(db_err)?;
 
     let _ = state.store.set(&cache_key(&page.slug), &page).await;
     Ok(HttpResponse::Created().json(page))
@@ -210,6 +224,7 @@ async fn create_page(
         (status = 404, description = "Not found")))]
 async fn update_page(
     state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     slug: web::Path<String>,
     body: web::Json<UpdatePageRequest>,
     auth: Claims,
@@ -234,10 +249,10 @@ async fn update_page(
     }
 
     let title = data.title.map(|t| t.trim().to_string());
-    let editor = resolve_author(&state, &auth).await;
-    let updated = PageService::update(state.db.as_ref(), &slug, title, data.content, editor)
+    let editor = resolve_author(db.as_ref(), &auth).await;
+    let updated = PageService::update(db.as_ref(), &slug, title, data.content, editor)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
 
     // Invalida la caché: la próxima lectura repuebla con el valor fresco.
@@ -251,13 +266,14 @@ async fn update_page(
         (status = 404, description = "Not found")))]
 async fn delete_page(
     state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     slug: web::Path<String>,
     _auth: Claims,
 ) -> Result<impl Responder, AppError> {
     let slug = slug.into_inner();
-    let deleted = PageService::delete(state.db.as_ref(), &slug)
+    let deleted = PageService::delete(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?;
+        .map_err(db_err)?;
     if !deleted {
         return Err(AppError::NotFound);
     }
@@ -269,49 +285,49 @@ async fn delete_page(
     params(("q" = String, Query, description = "Search term")),
     responses((status = 200, body = Vec<model::Model>)))]
 async fn search_pages(
-    state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     query: web::Query<SearchQuery>,
 ) -> Result<impl Responder, AppError> {
     let q = query.into_inner().q;
     if q.trim().is_empty() {
         return Ok(HttpResponse::Ok().json(Vec::<model::Model>::new()));
     }
-    let results = PageService::search(state.db.as_ref(), q.trim())
+    let results = PageService::search(db.as_ref(), q.trim())
         .await
-        .map_err(AppError::from)?;
+        .map_err(db_err)?;
     Ok(HttpResponse::Ok().json(results))
 }
 
 #[utoipa::path(get, path = "/api/wiki/pages/{slug}/revisions",
     responses((status = 200, body = Vec<revision::Model>), (status = 404, description = "Not found")))]
 async fn list_revisions(
-    state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     slug: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
-    let page = PageService::get_by_slug(state.db.as_ref(), &slug)
+    let page = PageService::get_by_slug(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
-    let revisions = PageService::list_revisions(state.db.as_ref(), page.id)
+    let revisions = PageService::list_revisions(db.as_ref(), page.id)
         .await
-        .map_err(AppError::from)?;
+        .map_err(db_err)?;
     Ok(HttpResponse::Ok().json(revisions))
 }
 
 #[utoipa::path(get, path = "/api/wiki/pages/{slug}/revisions/{rev}",
     responses((status = 200, body = revision::Model), (status = 404, description = "Not found")))]
 async fn get_revision(
-    state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     path: web::Path<(String, i32)>,
 ) -> Result<impl Responder, AppError> {
     let (slug, rev) = path.into_inner();
-    let page = PageService::get_by_slug(state.db.as_ref(), &slug)
+    let page = PageService::get_by_slug(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
-    let revision = PageService::get_revision(state.db.as_ref(), page.id, rev)
+    let revision = PageService::get_revision(db.as_ref(), page.id, rev)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
     Ok(HttpResponse::Ok().json(revision))
 }
@@ -322,31 +338,32 @@ async fn get_revision(
         (status = 404, description = "Not found")))]
 async fn restore_revision(
     state: web::Data<AppState>,
+    db: web::Data<DatabaseConnection>,
     path: web::Path<(String, i32)>,
     auth: Claims,
 ) -> Result<impl Responder, AppError> {
     let (slug, rev) = path.into_inner();
-    let page = PageService::get_by_slug(state.db.as_ref(), &slug)
+    let page = PageService::get_by_slug(db.as_ref(), &slug)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
-    let snapshot = PageService::get_revision(state.db.as_ref(), page.id, rev)
+    let snapshot = PageService::get_revision(db.as_ref(), page.id, rev)
         .await
-        .map_err(AppError::from)?
+        .map_err(db_err)?
         .ok_or(AppError::NotFound)?;
 
     // Restaurar = aplicar el contenido de la revisión como una nueva edición
     // (genera, a su vez, una nueva revisión). El historial nunca se reescribe.
-    let editor = resolve_author(&state, &auth).await;
+    let editor = resolve_author(db.as_ref(), &auth).await;
     let updated = PageService::update(
-        state.db.as_ref(),
+        db.as_ref(),
         &slug,
         Some(snapshot.title),
         Some(snapshot.content),
         editor,
     )
     .await
-    .map_err(AppError::from)?
+    .map_err(db_err)?
     .ok_or(AppError::NotFound)?;
 
     let _ = state.store.del(&cache_key(&slug)).await;

@@ -1,0 +1,23 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2021"
+
+# Crate INDEPENDIENTE (como `wiki`): consume `pulse_core` como path-dependency,
+# igual que cualquier app real. Workspace propio para no entrar en el del core.
+[workspace]
+
+[dependencies]
+# Del framework reutilizamos SOLO la pieza de auth (JWT). Este ejemplo NO usa
+# `bootstrap` ni base de datos: demuestra que, tras el desacople, puedes tomar
+# componentes sueltos del core (`auth::jwt`) sin arrastrar todo el motor.
+pulse_core = { path = "../.." }
+
+# Mismas versiones que el core → Cargo unifica cada crate a una sola instancia.
+actix-web = "4.12.1"
+# WebSockets sin actores: handshake + (Session, MessageStream).
+actix-ws = "0.3"
+tokio = { version = "1.48", features = ["full"] }
+futures-util = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"

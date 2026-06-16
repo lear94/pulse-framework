@@ -6,8 +6,8 @@
 
 use crate::model::{self, ActiveModel, Entity as Page};
 use crate::revision;
-use pulse_core::core::query::{PageParams, Paginable, PaginatedResult};
-use pulse_core::core::transaction::AtomicFlow;
+use pulse_core::core::query::{PageParams, PaginatedResult};
+use pulse_core::persistence::seaorm::{AtomicFlow, Paginable};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement,

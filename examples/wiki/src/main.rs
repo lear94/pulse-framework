@@ -8,6 +8,8 @@
 //! La app NO reimplementa auth, salud, métricas, caché ni shutdown: todo eso lo
 //! aporta el framework. La wiki solo añade su entidad, su servicio y sus rutas.
 
+use actix_web::web;
+use pulse_core::persistence::seaorm::entity as core_user;
 use pulse_core::{bootstrap, PulseConfig};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set,
@@ -92,13 +94,13 @@ async fn ensure_schema_and_seed(database_url: &str) -> Result<(), Box<dyn std::e
 
     // Usuario admin de demo (idempotente). Coste bcrypt bajo a propósito: el
     // build de demo suele ser debug y un coste 12 haría el login lento.
-    let exists = pulse_core::models::user::Entity::find()
-        .filter(pulse_core::models::user::Column::Username.eq(SEED_USER))
+    let exists = core_user::Entity::find()
+        .filter(core_user::Column::Username.eq(SEED_USER))
         .one(&db)
         .await?;
     if exists.is_none() {
         let hash = bcrypt::hash(SEED_PASSWORD, 6)?;
-        pulse_core::models::user::ActiveModel {
+        core_user::ActiveModel {
             username: Set(SEED_USER.to_string()),
             email: Set("admin@wiki.local".to_string()),
             password_hash: Set(hash),
@@ -200,6 +202,16 @@ async fn main() -> std::io::Result<()> {
     let mut openapi = api::WikiApiDoc::openapi();
     openapi.merge(pulse_core::api::ApiDoc::openapi());
 
+    // Conexión PROPIA de la wiki: tras desacoplar el ORM, el framework ya no
+    // expone su pool por `AppState`, así que la app gestiona la suya y la inyecta
+    // en sus rutas. `web::Data` la comparte (Arc) entre los workers de Actix.
+    let wiki_db = web::Data::new(
+        Database::connect(&config.database_url)
+            .await
+            .map_err(|e| std::io::Error::other(format!("wiki DB connect failed: {e}")))?,
+    );
+    let configure = move |cfg: &mut web::ServiceConfig| api::configure(cfg, wiki_db.clone());
+
     println!("📖 Pulse Wiki on http://localhost:8080  (Swagger: /swagger-ui/)");
-    bootstrap(config, api::configure, openapi).await
+    bootstrap(config, configure, openapi).await
 }

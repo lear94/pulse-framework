@@ -8,8 +8,11 @@
 pub mod entity;
 mod support;
 
+// Helpers SeaORM reutilizables por apps que definan SUS propias entidades
+// (transacción atómica + paginación tipada). Públicos aquí, NO en `core`.
+pub use self::support::{AtomicFlow, Paginable};
+
 use self::entity::{self as user, Entity as UserEntity};
-use self::support::{AtomicFlow, Paginable};
 use super::{Datastore, NewUser, RepoError, RepoResult, User, UserRepository};
 use crate::core::query::{PageParams, PaginatedResult};
 use async_trait::async_trait;
