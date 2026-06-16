@@ -1,12 +1,7 @@
-use crate::core::query::{PageParams, Paginable, PaginatedResult};
-use crate::core::transaction::{AtomicFlow, TxResult};
-use crate::models::user::{self, Entity as UserEntity};
+use crate::core::query::{PageParams, PaginatedResult};
+use crate::persistence::{NewUser, RepoError, RepoResult, User};
 use crate::pulse::PulseSignal;
 use crate::state::AppState;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DbErr, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
-};
 use std::sync::OnceLock;
 use tracing::warn;
 
@@ -28,28 +23,15 @@ fn dummy_hash() -> &'static str {
 impl UserService {
     /// ¿Existe ya un usuario con ese username o email? Para devolver 409 antes
     /// de intentar el INSERT (el índice UNIQUE es el guardián definitivo).
-    pub async fn exists(state: &AppState, username: &str, email: &str) -> Result<bool, DbErr> {
-        let count = UserEntity::find()
-            .filter(
-                Condition::any()
-                    .add(user::Column::Username.eq(username))
-                    .add(user::Column::Email.eq(email)),
-            )
-            .count(state.db.as_ref())
-            .await?;
-        Ok(count > 0)
+    pub async fn exists(state: &AppState, username: &str, email: &str) -> RepoResult<bool> {
+        state.users.exists(username, email).await
     }
 
     /// Autentica por username + contraseña. Devuelve el id solo si la
     /// contraseña coincide con el hash almacenado (comparación en tiempo
     /// constante vía bcrypt).
     pub async fn login(state: &AppState, username: String, password: String) -> Option<String> {
-        let user = UserEntity::find()
-            .filter(user::Column::Username.eq(username))
-            .one(state.db.as_ref())
-            .await
-            .ok()
-            .flatten();
+        let user = state.users.find_by_username(&username).await.ok().flatten();
         // Siempre ejecutamos bcrypt::verify (contra el hash real o uno dummy) en
         // un hilo bloqueante: es CPU-bound y ahogaría el executor async. Verificar
         // incluso sin usuario iguala la latencia (anti enumeración).
@@ -72,65 +54,40 @@ impl UserService {
         username: String,
         email: String,
         password: String,
-    ) -> TxResult<user::Model> {
-        // Hasheamos fuera de la transacción y en un hilo bloqueante: bcrypt es
+    ) -> RepoResult<User> {
+        // Hasheamos fuera de la persistencia y en un hilo bloqueante: bcrypt es
         // CPU-bound (~decenas de ms) y bloquearía un worker del executor async.
+        // El hashing es lógica de dominio, por eso vive aquí y no en el repo.
         let password_hash =
             tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
                 .await
-                .map_err(|e| DbErr::Custom(format!("hash task join failed: {e}")))?
-                .map_err(|e| DbErr::Custom(format!("password hashing failed: {e}")))?;
+                .map_err(|e| RepoError::Backend(format!("hash task join failed: {e}")))?
+                .map_err(|e| RepoError::Backend(format!("password hashing failed: {e}")))?;
 
-        let execution_result = AtomicFlow::run(state.db.as_ref(), |txn| {
-            // [OPT] Movemos los strings dentro del closure (Zero-Copy)
-            // Necesitamos clonar para el closure, pero es barato porque son punteros a heap
-            let u = username.clone();
-            let e = email.clone();
-            let ph = password_hash.clone();
-
-            Box::pin(async move {
-                let new_user = user::ActiveModel {
-                    username: Set(u),
-                    email: Set(e),
-                    password_hash: Set(ph),
-                    ..Default::default()
-                };
-                new_user.insert(txn).await
+        let user = state
+            .users
+            .insert(NewUser {
+                username,
+                email,
+                password_hash,
             })
-        })
-        .await;
+            .await?;
 
-        match execution_result {
-            Ok(user) => {
-                // Serialización ahora es binaria (bincode) internamente
-                if let Err(e) = state.store.set(&user.id.to_string(), &user).await {
-                    warn!("Cache update failed: {}", e);
-                }
-                state
-                    .pulse
-                    .emit(PulseSignal::UserCreated(user.id.to_string()))
-                    .await;
-                Ok(user)
-            }
-            Err(e) => Err(e),
+        // Serialización binaria (bincode) internamente.
+        if let Err(e) = state.store.set(&user.id.to_string(), &user).await {
+            warn!("Cache update failed: {}", e);
         }
+        state
+            .pulse
+            .emit(PulseSignal::UserCreated(user.id.to_string()))
+            .await;
+        Ok(user)
     }
 
     pub async fn find_all(
         state: &AppState,
         params: PageParams,
-    ) -> Result<PaginatedResult<user::Model>, sea_orm::DbErr> {
-        let paginator = UserEntity::find()
-            .order_by_desc(user::Column::CreatedAt)
-            .paginate_custom(state.db.as_ref(), &params);
-        let total = paginator.num_items().await?;
-        let pages = paginator.num_pages().await?;
-        let data = paginator.fetch_page(params.page.saturating_sub(1)).await?;
-        Ok(PaginatedResult {
-            data,
-            total,
-            page: params.page,
-            pages,
-        })
+    ) -> RepoResult<PaginatedResult<User>> {
+        state.users.find_all(&params).await
     }
 }

@@ -6,14 +6,17 @@ use crate::core::monitor::SystemMonitor;
 use crate::core::orchestrator::Orchestrator;
 use crate::core::queue::TaskQueue;
 use crate::core::ratelimit::RateLimit;
+use crate::persistence::{Datastore, UserRepository};
 use crate::pulse::PulseReactor;
 use crate::store::HybridStore;
-use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<DatabaseConnection>,
+    /// Persistencia del dominio tras un trait: el ORM concreto es intercambiable.
+    pub users: Arc<dyn UserRepository>,
+    /// Health-check del almacén (aísla el pool concreto del ORM).
+    pub datastore: Arc<dyn Datastore>,
     pub pulse: Arc<dyn PulseReactor>,
     pub store: HybridStore,
     pub monitor: Arc<SystemMonitor>,
@@ -31,7 +34,8 @@ pub struct AppState {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: Arc<DatabaseConnection>,
+        users: Arc<dyn UserRepository>,
+        datastore: Arc<dyn Datastore>,
         pulse: Arc<dyn PulseReactor>,
         store: HybridStore,
         auth: Arc<dyn IdentityProvider>,
@@ -43,7 +47,8 @@ impl AppState {
         rate_limiter: Arc<dyn RateLimit>,
     ) -> Self {
         Self {
-            db,
+            users,
+            datastore,
             pulse,
             store,
             monitor: SystemMonitor::new(),

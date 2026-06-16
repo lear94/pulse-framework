@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod core;
 pub mod models;
+pub mod persistence;
 pub mod pulse;
 pub mod services;
 pub mod state;
@@ -34,6 +35,8 @@ use crate::core::queue::{
     JobHandlers, TaskQueue,
 };
 use crate::core::ratelimit::{MemoryRateLimiter, RateLimit, RedisRateLimiter};
+use crate::persistence::seaorm::{SeaOrmDatastore, SeaOrmUserRepository};
+use crate::persistence::{Datastore, UserRepository};
 use crate::services::recovery_service::RecoveryService;
 use crate::pulse::{memory::MemoryReactor, redis::RedisReactor, PulseReactor};
 use crate::state::AppState;
@@ -216,8 +219,14 @@ where
     let blackbox: Arc<dyn FlightRecorder> =
         Arc::new(FallbackFlightRecorder::new(db_recorder, disk_recorder));
 
+    // Repositorios de dominio tras traits: aquí (bootstrap) es el ÚNICO sitio
+    // que conoce el ORM concreto. Cambiar de ORM = cambiar estas dos líneas.
+    let users: Arc<dyn UserRepository> = Arc::new(SeaOrmUserRepository::new(db.clone()));
+    let datastore: Arc<dyn Datastore> = Arc::new(SeaOrmDatastore::new(db.clone()));
+
     let state = AppState::new(
-        db,
+        users,
+        datastore,
         pulse_reactor,
         store,
         auth_provider,

@@ -6,6 +6,7 @@ mod integrity_tests {
     use pulse_core::auth::authenticator::DbAuthenticator;
     use pulse_core::core::queue::memory::MemoryQueue;
     use pulse_core::core::ratelimit::MemoryRateLimiter;
+    use pulse_core::persistence::seaorm::{SeaOrmDatastore, SeaOrmUserRepository};
     use pulse_core::pulse::memory::MemoryReactor;
     use pulse_core::store::{memory::MemoryBackend, HybridStore};
     use pulse_core::{api, auth::jwt::JwtProvider, state::AppState};
@@ -26,9 +27,11 @@ mod integrity_tests {
                 created_at: chrono::Utc::now().naive_utc(),
             }]])
             .into_connection();
+        let db = Arc::new(db_conn);
 
         AppState::new(
-            Arc::new(db_conn),
+            Arc::new(SeaOrmUserRepository::new(db.clone())),
+            Arc::new(SeaOrmDatastore::new(db.clone())),
             MemoryReactor::new(100).0,
             HybridStore::new(Arc::new(MemoryBackend)),
             Arc::new(JwtProvider::new("test_secret_value_long".into())),

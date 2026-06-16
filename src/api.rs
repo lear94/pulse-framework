@@ -3,8 +3,8 @@ use crate::core::blackbox::FlightRecord;
 use crate::core::error::AppError;
 use crate::core::monitor::MonitorSnapshot;
 use crate::core::query::{PageParams, PaginatedResult};
+use crate::persistence::User;
 use crate::core::validation::{validate_email, validate_password, validate_username};
-use crate::models::user;
 use crate::services::recovery_service::RecoveryService;
 use crate::services::user_service::UserService;
 use crate::state::AppState;
@@ -123,7 +123,7 @@ impl FromRequest for AdminClaims {
 #[derive(OpenApi)]
 #[openapi(
     paths(login, refresh, logout, create_user, list_users, health_check, metrics, get_monitor, list_failed_jobs, replay_job),
-    components(schemas(user::Model, LoginRequest, CreateUserRequest, RefreshRequest, PaginatedResult<user::Model>, MonitorSnapshot, FlightRecord)),
+    components(schemas(User, LoginRequest, CreateUserRequest, RefreshRequest, PaginatedResult<User>, MonitorSnapshot, FlightRecord)),
     security(("jwt_auth" = []))
 )]
 pub struct ApiDoc;
@@ -277,7 +277,7 @@ async fn logout(state: web::Data<AppState>, claims: Claims) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({ "status": "logged_out" }))
 }
 
-#[utoipa::path(get, path = "/api/v1/users", params(PageParams), security(("jwt_auth" = [])), responses((status = 200, body = PaginatedResult<user::Model>)))]
+#[utoipa::path(get, path = "/api/v1/users", params(PageParams), security(("jwt_auth" = [])), responses((status = 200, body = PaginatedResult<User>)))]
 async fn list_users(
     state: web::Data<AppState>,
     info: web::Query<PageParams>,
@@ -289,7 +289,7 @@ async fn list_users(
     Ok(HttpResponse::Ok().json(result))
 }
 
-#[utoipa::path(post, path = "/api/v1/users", request_body = CreateUserRequest, responses((status = 201, body = user::Model), (status = 400, description = "Validation error"), (status = 409, description = "Username/email taken"), (status = 429, description = "Rate limited")))]
+#[utoipa::path(post, path = "/api/v1/users", request_body = CreateUserRequest, responses((status = 201, body = User), (status = 400, description = "Validation error"), (status = 409, description = "Username/email taken"), (status = 429, description = "Rate limited")))]
 async fn create_user(
     http: HttpRequest,
     state: web::Data<AppState>,
@@ -349,7 +349,7 @@ async fn create_user(
 
 #[utoipa::path(get, path = "/api/v1/health", responses((status = 200, description = "Operational"), (status = 503, description = "Degraded")))]
 async fn health_check(state: web::Data<AppState>) -> impl Responder {
-    let db_ok = state.db.as_ref().ping().await.is_ok();
+    let db_ok = state.datastore.ping().await;
     // None = backend remoto no configurado (modo local) → no penaliza la salud.
     let backend_health = state.store.health().await;
     let backend_ok = backend_health.unwrap_or(true);
